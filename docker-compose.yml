@@ -1,0 +1,19 @@
+services:
+  crymoder:
+    build: .
+    image: crymoder:latest
+    container_name: crymoder
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/crymoder.db
+    volumes:
+      - crymoder-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  crymoder-data:
