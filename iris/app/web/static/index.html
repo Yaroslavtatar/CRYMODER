@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chat Manager — панель</title>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--ink:#1b1f27;--mute:#697386;--line:#e3e6ec;--acc:#2f6bff;--acc-ink:#fff;--bad:#d4303f;--ok:#1f9d5b;--warn:#c27a00;--chip:#eef1f6}
+@media(prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1b2029;--ink:#e8ebf1;--mute:#8d97a8;--line:#2b3240;--acc:#5b8cff;--acc-ink:#0b1020;--bad:#ff6b78;--ok:#43c985;--warn:#f0b24a;--chip:#252c39}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;gap:12px;align-items:center;padding:12px 16px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+header h1{font-size:17px;margin:0;font-weight:650}
+header .sp{flex:1}
+select,input,button,textarea{font:inherit;color:inherit}
+select,input[type=text],input[type=number],textarea{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:7px 10px;min-width:0}
+button{background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:7px 12px;cursor:pointer}
+button:hover{border-color:var(--acc)}
+button.pri{background:var(--acc);color:var(--acc-ink);border-color:var(--acc)}
+button.dng{color:var(--bad)}
+button:disabled{opacity:.5;cursor:default}
+nav{display:flex;gap:4px;padding:8px 16px 0;overflow-x:auto;background:var(--card);border-bottom:1px solid var(--line)}
+nav button{border:0;border-bottom:2px solid transparent;border-radius:0;background:none;padding:10px 12px;white-space:nowrap}
+nav button.on{border-bottom-color:var(--acc);color:var(--acc);font-weight:600}
+main{max-width:1100px;margin:0 auto;padding:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+.stat b{display:block;font-size:26px;font-weight:650}
+.stat span{color:var(--mute);font-size:13px}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+th{font-size:12px;color:var(--mute);font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+.tablewrap{overflow-x:auto}
+.chip{display:inline-block;background:var(--chip);border-radius:999px;padding:2px 9px;font-size:12px;margin-right:4px}
+.chip.bad{color:var(--bad)}.chip.warn{color:var(--warn)}.chip.ok{color:var(--ok)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.mute{color:var(--mute)}
+.set{display:grid;grid-template-columns:1fr minmax(160px,260px);gap:10px 16px;align-items:center;padding:10px 0;border-bottom:1px solid var(--line)}
+.set small{display:block;color:var(--mute)}
+.sect{margin:18px 0 6px;font-weight:650}
+#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;opacity:0;pointer-events:none;transition:.2s;max-width:90vw;z-index:20}
+#toast.show{opacity:1}
+dialog{border:1px solid var(--line);border-radius:14px;background:var(--card);color:var(--ink);padding:18px;width:min(420px,92vw)}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+dialog label{display:block;margin:10px 0 4px;color:var(--mute);font-size:13px}
+dialog input,dialog select,dialog textarea{width:100%}
+.empty{padding:28px;text-align:center;color:var(--mute)}
+.login{max-width:420px;margin:12vh auto;text-align:center}
+@media(max-width:640px){.set{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toast"></div>
+<dialog id="dlg"></dialog>
+<script>
+const RANKS=["участник","мл. модератор","ст. модератор","мл. администратор","ст. администратор","создатель"];
+const $=(s,e=document)=>e.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const S={me:null,chat:null,tab:"overview",q:"",page:0};
+const fmt=t=>t?new Date(t*1000).toLocaleString("ru-RU",{day:"2-digit",month:"2-digit",year:"2-digit",hour:"2-digit",minute:"2-digit"}):"—";
+const until=t=>(!t||t<0)?"навсегда":"до "+fmt(t);
+
+async function api(path,body){
+  const r=await fetch("/api"+path,body===undefined?{}:{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  let d={};try{d=await r.json()}catch(e){}
+  if(r.status===401){S.me=null;render();throw new Error("auth")}
+  if(!r.ok)throw new Error(d.detail||d.error||("Ошибка "+r.status));
+  return d;
+}
+function toast(t){const e=$("#toast");e.textContent=t;e.classList.add("show");clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove("show"),3500)}
+async function run(path,body,reload=true){
+  try{const d=await api(path,body);toast(d.text||"Готово");if(reload)await show();return d}
+  catch(e){if(e.message!=="auth")toast("⚠ "+e.message)}
+}
+function ask(title,fields,ok="Применить"){
+  return new Promise(res=>{
+    const d=$("#dlg");
+    d.innerHTML=`<form method="dialog"><h3 style="margin:0 0 6px">${esc(title)}</h3>${fields.map(f=>`<label>${esc(f.label)}</label>`+
+      (f.type==="select"?`<select name="${f.name}">${f.options.map(o=>`<option value="${esc(o[0])}">${esc(o[1])}</option>`).join("")}</select>`
+      :`<input type="text" name="${f.name}" placeholder="${esc(f.ph||"")}" value="${esc(f.value||"")}">`)).join("")}
+      <div class="row" style="margin:16px 0 0;justify-content:flex-end"><button value="x" type="button" id="cx">Отмена</button><button class="pri" value="ok">${ok}</button></div></form>`;
+    $("#cx",d).onclick=()=>d.close();
+    d.onclose=()=>{if(d.returnValue==="ok"){const o={};fields.forEach(f=>o[f.name]=d.querySelector(`[name=${f.name}]`).value);res(o)}else res(null)};
+    d.returnValue="";d.showModal();
+  });
+}
+const TABS=[["overview","Обзор"],["members","Участники"],["punish","Наказания"],["staff","Модераторы"],["clean","Чистка"],["settings","Настройки"],["access","Доступ команд"],["audit","Журнал"]];
+
+async function boot(){
+  try{S.me=await api("/me");if(!S.chat&&S.me.chats.length)S.chat=S.me.chats[0].chat_id}catch(e){S.me=null}
+  render();
+}
+function render(){
+  const app=$("#app");
+  if(!S.me){app.innerHTML=`<div class="login card"><h2>Chat Manager</h2><p class="mute">Вход только через бота. Напишите ему в личные сообщения слово <b>панель</b> — он пришлёт одноразовую ссылку.</p></div>`;return}
+  if(!S.me.chats.length){app.innerHTML=`<header><h1>Chat Manager</h1><span class="sp"></span><span>${esc(S.me.name)}</span></header><main><div class="card empty">У вас нет чатов, где вы модератор. Добавьте бота в чат и получите ранг командой «+модер».</div></main>`;return}
+  app.innerHTML=`<header><h1>Chat Manager</h1>
+    <select id="chatsel">${S.me.chats.map(c=>`<option value="${c.chat_id}" ${c.chat_id==S.chat?"selected":""}>${esc(c.title||c.chat_id)} · ${c.rank} ранг</option>`).join("")}</select>
+    <span class="sp"></span><span class="mute">${esc(S.me.name)}</span><button id="out">Выйти</button></header>
+    <nav>${TABS.map(t=>`<button data-t="${t[0]}" class="${S.tab===t[0]?"on":""}">${t[1]}</button>`).join("")}</nav><main id="view"></main>`;
+  $("#chatsel").onchange=e=>{S.chat=+e.target.value;S.page=0;S.q="";show()};
+  $("#out").onclick=async()=>{await api("/logout",{});S.me=null;render()};
+  document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{S.tab=b.dataset.t;S.page=0;render();show()});
+  show();
+}
+async function show(){
+  const v=$("#view");if(!v||!S.chat)return;
+  try{await VIEWS[S.tab](v)}catch(e){if(e.message!=="auth")v.innerHTML=`<div class="card empty">${esc(e.message)}</div>`}
+}
+const rankBadge=r=>r?`<span class="chip ok">${RANKS[r]} (${r})</span>`:"";
+const VIEWS={
+async overview(v){
+  const o=await api(`/chats/${S.chat}/overview`);
+  v.innerHTML=`<div class="grid">
+  ${[["Участников",o.members],["Сообщений сегодня",o.msgs_today],["За 7 дней",o.msgs_week],["Модераторов",o.staff],["Банов",o.bans],["Мутов",o.mutes],["Предупреждений",o.warns]].map(x=>`<div class="card stat"><b>${x[1]}</b><span>${x[0]}</span></div>`).join("")}</div>
+  <div class="card"><div class="row"><b>${esc(o.title)}</b><span class="chip">код: ${esc(o.code)}</span><span class="chip">ваш ранг: ${o.my_rank}</span></div>
+  <div class="row"><span>Чат сейчас: <b>${o.chat_open?"открыт":"закрыт"}</b></span>
+  <button id="tog">${o.chat_open?"🔒 Закрыть чат":"🔓 Открыть чат"}</button>
+  <button id="am" class="dng">🕊 Амнистия (снять все баны)</button></div></div>`;
+  $("#tog").onclick=()=>run(`/chats/${S.chat}/chat_open`,{open:!o.chat_open});
+  $("#am").onclick=()=>confirm("Разблокировать всех из банлиста?")&&run(`/chats/${S.chat}/amnesty`,{});
+},
+async members(v){
+  const d=await api(`/chats/${S.chat}/members?q=${encodeURIComponent(S.q)}&page=${S.page}`);
+  v.innerHTML=`<div class="row"><input id="q" type="text" placeholder="Поиск: имя, @ник или ID" value="${esc(S.q)}" style="flex:1;min-width:200px"><button id="go" class="pri">Найти</button><span class="mute">Всего: ${d.total}</span></div>
+  <div class="card tablewrap"><table><thead><tr><th>Участник</th><th>Сообщ.</th><th>Был(а)</th><th>Статус</th><th></th></tr></thead><tbody>
+  ${d.items.map(m=>`<tr><td><b>${esc(m.name)}</b>${m.username?` <span class="mute">@${esc(m.username)}</span>`:""}<br><span class="mute">${m.user_id}</span></td><td>${m.msgs}</td><td>${fmt(m.last_seen)}</td>
+  <td>${rankBadge(m.rank)}${m.warns?`<span class="chip warn">⚠ ${m.warns}</span>`:""}${m.muted?`<span class="chip bad">🔇 мут</span>`:""}</td>
+  <td style="white-space:nowrap"><button data-u="${m.user_id}" data-n="${esc(m.name)}">Действия</button></td></tr>`).join("")||`<tr><td colspan=5 class="empty">Никого не найдено</td></tr>`}
+  </tbody></table></div>
+  <div class="row" style="margin-top:12px"><button id="pv" ${S.page?"":"disabled"}>← Назад</button><button id="nx" ${(S.page+1)*50<d.total?"":"disabled"}>Вперёд →</button></div>`;
+  const go=()=>{S.q=$("#q").value;S.page=0;show()};$("#go").onclick=go;$("#q").onkeydown=e=>e.key==="Enter"&&go();
+  $("#pv").onclick=()=>{S.page--;show()};$("#nx").onclick=()=>{S.page++;show()};
+  v.querySelectorAll("button[data-u]").forEach(b=>b.onclick=()=>userActions(+b.dataset.u,b.dataset.n));
+},
+async punish(v){
+  const d=await api(`/chats/${S.chat}/punishments`);
+  const tb=(rows,cols,empty)=>rows.length?`<div class="card tablewrap"><table><thead><tr>${cols.map(c=>`<th>${c[0]}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${c[1](r)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`:`<div class="card empty">${empty}</div>`;
+  const base=[["Кто",r=>`<b>${esc(r.name)}</b><br><span class="mute">${r.user_id}</span>`],["Причина",r=>esc(r.reason||"—")],["Выдал",r=>esc(r.by_name)]];
+  v.innerHTML=`<div class="sect">🚫 Баны (${d.bans.length})</div>`+tb(d.bans,[...base,["Срок",r=>until(r.until)],["",r=>`<button data-a="unban" data-u="${r.user_id}">Разбанить</button>`]],"Банлист пуст")
+  +`<div class="sect">🔇 Муты (${d.mutes.length})</div>`+tb(d.mutes,[...base,["Срок",r=>until(r.until)],["",r=>`<button data-a="unmute" data-u="${r.user_id}">Снять мут</button>`]],"Замутенных нет")
+  +`<div class="sect">⚠️ Предупреждения (${d.warns.length})</div>`+tb(d.warns,[...base,["Выдано",r=>fmt(r.created_at)],["Истекает",r=>r.expires_at?fmt(r.expires_at):"бессрочно"],["",r=>`<button data-a="unwarn" data-u="${r.user_id}">Снять</button>`]],"Предупреждений нет");
+  v.querySelectorAll("button[data-a]").forEach(b=>b.onclick=()=>run(`/chats/${S.chat}/action`,{action:b.dataset.a,user_id:+b.dataset.u}));
+},
+async staff(v){
+  const d=await api(`/chats/${S.chat}/staff`);
+  v.innerHTML=`<div class="row"><button id="add" class="pri">+ Назначить модератора</button></div><div class="card tablewrap"><table><thead><tr><th>Модератор</th><th>Ранг</th><th>Назначил</th><th>Когда</th><th></th></tr></thead><tbody>
+  ${d.map(s=>`<tr><td><b>${esc(s.name)}</b><br><span class="mute">${s.user_id}</span></td><td>${rankBadge(s.rank)}</td><td>${esc(s.by)}</td><td>${fmt(s.at)}</td><td><button data-u="${s.user_id}" data-n="${esc(s.name)}">Изменить ранг</button></td></tr>`).join("")||`<tr><td colspan=5 class="empty">Модераторов нет</td></tr>`}</tbody></table></div>`;
+  $("#add").onclick=async()=>{const r=await ask("Назначить модератора",[{name:"u",label:"ID пользователя (число). Найти можно во вкладке «Участники»",ph:"123456789"},rankField()]);if(r)run(`/chats/${S.chat}/action`,{action:"rank",user_id:+r.u,rank:+r.rank})};
+  v.querySelectorAll("button[data-u]").forEach(b=>b.onclick=()=>changeRank(+b.dataset.u,b.dataset.n));
+},
+async clean(v){
+  v.innerHTML=`<div class="card"><p class="mute" style="margin-top:0">Сначала «Предпросмотр» покажет, сколько человек будет исключено. Модераторы не затрагиваются. Исключённые смогут вернуться по ссылке.</p>
+  <div class="row"><select id="mode"><option value="inactive">Неактивные (давно не писали)</option><option value="silent">Молчуны (ни одного сообщения)</option><option value="newcomers">Новички (вступили недавно)</option><option value="active">Активные за последние минуты (рейд)</option><option value="deleted">Удалённые аккаунты</option></select>
+  <input id="val" type="number" min="0" value="30" style="width:90px"><select id="unit"><option value="minutes">минут</option><option value="hours">часов</option><option value="days" selected>дней</option></select></div>
+  <div class="row"><button id="pre">Предпросмотр</button><button id="doit" class="dng" disabled>Исключить</button></div><div id="res" class="mute"></div></div>`;
+  const body=()=>({mode:$("#mode").value,value:$("#val").value,unit:$("#unit").value});
+  $("#pre").onclick=async()=>{try{const d=await api(`/chats/${S.chat}/clean/preview`,body());$("#res").innerHTML=`Будет исключено: <b>${d.count}</b>${d.sample.length?"<br>"+d.sample.map(esc).join(", ")+(d.count>d.sample.length?"…":""):""}`;$("#doit").disabled=!d.count}catch(e){toast("⚠ "+e.message)}};
+  $("#doit").onclick=async()=>{if(confirm("Исключить найденных участников?")){await run(`/chats/${S.chat}/clean/run`,body(),false);$("#doit").disabled=true;$("#res").textContent=""}};
+},
+async settings(v){
+  const d=await api(`/chats/${S.chat}/settings`);
+  v.innerHTML=`<div class="card">${d.map(s=>`<div class="set"><div>${esc(s.desc)}<small>${s.key}</small></div><div>${ctl(s)}</div></div>`).join("")}</div>`;
+  v.querySelectorAll("[data-k]").forEach(el=>{
+    const k=el.dataset.k,t=el.dataset.t;
+    const save=()=>{let val=el.type==="checkbox"?el.checked:el.value;if(t==="secs")val=Math.round(parseFloat(val||0)*3600);run(`/chats/${S.chat}/settings`,{key:k,value:val},false)};
+    if(el.tagName==="BUTTON")el.onclick=save;else el.onchange=save;
+  });
+},
+async access(v){
+  const d=await api(`/chats/${S.chat}/access`);
+  const secs=[...new Set(d.map(c=>c.section))];
+  v.innerHTML=`<div class="row"><span class="mute">Минимальный ранг для команды. 0 — всем, 6 — выключена. Изменения действуют и в чате, и в панели.</span><span class="sp" style="flex:1"></span><button id="rs" class="dng">Сбросить всё</button></div>`+
+  secs.map(s=>`<div class="sect">${esc(s)}</div><div class="card tablewrap"><table><tbody>${d.filter(c=>c.section===s).map(c=>`<tr><td>${esc(c.title)}<br><span class="mute">${c.number}. ${esc(c.code)}</span></td><td style="width:170px"><select data-c="${esc(c.code)}">${[0,1,2,3,4,5,6].map(r=>`<option value="${r}" ${r===c.rank?"selected":""}>${r===6?"выключена":r===0?"0 — все":r+" — "+RANKS[r]}</option>`).join("")}</select></td></tr>`).join("")}</tbody></table></div>`).join("");
+  v.querySelectorAll("select[data-c]").forEach(el=>el.onchange=()=>run(`/chats/${S.chat}/access`,{code:el.dataset.c,rank:+el.value},false));
+  $("#rs").onclick=()=>confirm("Сбросить весь доступ команд к значениям по умолчанию?")&&run(`/chats/${S.chat}/access/reset`,{});
+},
+async audit(v){
+  const d=await api(`/chats/${S.chat}/audit`);
+  v.innerHTML=`<div class="card tablewrap"><table><thead><tr><th>Время</th><th>Кто</th><th>Действие</th><th>Детали</th><th>Откуда</th></tr></thead><tbody>${d.map(r=>`<tr><td>${fmt(r.at)}</td><td>${esc(r.by)}</td><td>${esc(r.action)}</td><td>${esc(r.detail)}</td><td><span class="chip">${r.source==="web"?"панель":"чат"}</span></td></tr>`).join("")||`<tr><td colspan=5 class="empty">Журнал пуст</td></tr>`}</tbody></table></div>`;
+}};
+function ctl(s){
+  const k=`data-k="${s.key}" data-t="${s.type}"`;
+  if(s.type==="bool")return`<input type="checkbox" ${k} ${s.value?"checked":""}>`;
+  if(s.type==="int")return`<input type="number" min="0" ${k} value="${s.value}">`;
+  if(s.type==="secs")return`<input type="number" step="any" ${k} value="${s.value>0?+(s.value/3600).toFixed(2):s.value}"> <small>часов (0 — выкл.)</small>`;
+  if(s.type.startsWith("choice:"))return`<select ${k}>${s.type.slice(7).split(",").map(o=>`<option ${o===s.value?"selected":""}>${o}</option>`).join("")}</select>`;
+  return`<textarea rows=4 ${k} style="width:100%">${esc(s.value)}</textarea>`;
+}
+const rankField=()=>({name:"rank",label:"Ранг",type:"select",options:RANKS.map((r,i)=>[i,`${i} — ${r}`]).slice(1)});
+async function changeRank(u,n){const r=await ask("Ранг: "+n,[{name:"rank",label:"Новый ранг (0 — снять модератора)",type:"select",options:RANKS.map((r,i)=>[i,`${i} — ${r}`]).filter(x=>x[0]<5)}]);if(r)run(`/chats/${S.chat}/action`,{action:"rank",user_id:u,rank:+r.rank})}
+async function userActions(u,n){
+  const r=await ask("Действие: "+n,[{name:"a",label:"Что сделать",type:"select",options:[["warn","⚠️ Предупреждение"],["mute","🔇 Мут"],["ban","🚫 Бан"],["kick","👢 Кик"],["unwarn","Снять последний варн"],["clear_warns","Снять все варны"],["unmute","🔊 Снять мут"],["unban","Разбан"],["rank","⭐ Изменить ранг"]]},
+    {name:"period",label:"Срок (для варна/мута/бана): 2 часа, 3 дня, навсегда. Пусто — по умолчанию чата",ph:"1 день"},{name:"reason",label:"Причина",ph:"спам"}]);
+  if(!r)return;
+  if(r.a==="rank")return changeRank(u,n);
+  run(`/chats/${S.chat}/action`,{action:r.a,user_id:u,period:r.period,reason:r.reason});
+}
+boot();
+</script>
+</body>
+</html>
