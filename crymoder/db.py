@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS badwords(
 CREATE TABLE IF NOT EXISTS captcha(
   chat_id INTEGER, user_id INTEGER, message_id INTEGER, expires_at INTEGER,
   PRIMARY KEY(chat_id, user_id));
+CREATE TABLE IF NOT EXISTS panel_admins(
+  user_id INTEGER PRIMARY KEY, added_by INTEGER, at INTEGER);
 """
 
 
@@ -107,6 +109,9 @@ class DB:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # встроенный LOWER() в SQLite понижает регистр только ASCII — поиск по кириллице не работал
+        self.conn.create_function("LOWER", 1, lambda s: s.lower() if isinstance(s, str) else s,
+                                  deterministic=True)
         self.lock = threading.RLock()
         with self.lock:
             self.conn.execute("PRAGMA journal_mode=WAL")

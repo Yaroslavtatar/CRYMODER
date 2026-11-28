@@ -1,5 +1,6 @@
 """Ядро: все действия модерации. Используется и командами бота, и веб-панелью,
 поэтому права проверяются здесь, а не в обработчиках."""
+import asyncio
 import logging
 import random
 import string
@@ -91,8 +92,15 @@ class Core:
         self._words: dict[int, list[str]] = {}
 
     @property
-    def super_admins(self) -> frozenset:
+    def owners(self) -> frozenset:
+        """Владельцы сервера из .env (OWNER_IDS / SUPER_ADMINS). Из панели не меняются."""
         return self.config.super_admins if self.config else frozenset()
+
+    @property
+    def super_admins(self) -> frozenset:
+        """Владельцы + администраторы панели, добавленные владельцем. Видят все чаты этого сервера."""
+        extra = frozenset(r["user_id"] for r in self.db.query("SELECT user_id FROM panel_admins"))
+        return self.owners | extra
 
     # ---------- Telegram helper ----------
     async def _tg(self, coro):
@@ -692,6 +700,136 @@ class Core:
                 r["name"] = self.name(r["user_id"])
                 r["by_name"] = self.name(r["by_id"]) if r.get("by_id") else "система"
         return {"bans": bans, "mutes": mutes, "warns": warns}
+
+    # ---------- админка сервера (все чаты этого экземпляра бота) ----------
+    def admin_overview(self) -> dict:
+        d = self.db
+        t = now()
+        return {
+            "chats": d.scalar("SELECT COUNT(*) FROM chats WHERE active=1", (), 0),
+            "chats_inactive": d.scalar("SELECT COUNT(*) FROM chats WHERE active=0", (), 0),
+            "users": d.scalar("SELECT COUNT(*) FROM users", (), 0),
+            "members": d.scalar("SELECT COUNT(*) FROM members m JOIN chats c ON c.chat_id=m.chat_id"
+                                " WHERE m.left=0 AND c.active=1", (), 0),
+            "msgs_today": d.scalar("SELECT SUM(cnt) FROM msg_daily WHERE day=?", (today_str(),), 0),
+            "msgs_week": d.scalar("SELECT SUM(cnt) FROM msg_daily WHERE day>=?", (day_ago(6),), 0),
+            "bans": d.scalar("SELECT COUNT(*) FROM bans", (), 0),
+            "mutes": d.scalar("SELECT COUNT(*) FROM mutes", (), 0),
+            "warns": d.scalar("SELECT COUNT(*) FROM warns WHERE expires_at=0 OR expires_at>?", (t,), 0),
+            "staff": d.scalar("SELECT COUNT(*) FROM ranks WHERE rank>0", (), 0),
+            "sessions": d.scalar("SELECT COUNT(*) FROM web_sessions WHERE expires_at>?", (t,), 0),
+            "panel_admins": d.scalar("SELECT COUNT(*) FROM panel_admins", (), 0),
+        }
+
+    def admin_chats(self, q: str = "", only_inactive: bool = False) -> list[dict]:
+        like = f"%{q.lower()}%"
+        where, args = ["c.active=?"], [0 if only_inactive else 1]
+        if q:
+            where.append("(LOWER(COALESCE(c.title,'')) LIKE ? OR CAST(c.chat_id AS TEXT) LIKE ? OR c.code LIKE ?)")
+            args += [like, like, q.upper() + "%"]
+        rows = self.db.query(
+            "SELECT c.chat_id, c.title, c.code, c.creator_id, c.created_at,"
+            " (SELECT COUNT(*) FROM members m WHERE m.chat_id=c.chat_id AND m.left=0) AS members,"
+            " (SELECT SUM(cnt) FROM msg_daily d WHERE d.chat_id=c.chat_id AND d.day>=?) AS msgs_week,"
+            " (SELECT COUNT(*) FROM bans b WHERE b.chat_id=c.chat_id) AS bans,"
+            " (SELECT COUNT(*) FROM ranks r WHERE r.chat_id=c.chat_id AND r.rank>0) AS staff,"
+            " (SELECT MAX(id) FROM audit a WHERE a.chat_id=c.chat_id) AS last_audit"
+            f" FROM chats c WHERE {' AND '.join(where)} ORDER BY c.title COLLATE NOCASE LIMIT 500",
+            [day_ago(6)] + args)
+        return [{"chat_id": r["chat_id"], "title": r["title"] or str(r["chat_id"]), "code": r["code"],
+                 "creator": self.name(r["creator_id"]) if r["creator_id"] else "—",
+                 "created_at": r["created_at"], "members": r["members"], "msgs_week": r["msgs_week"] or 0,
+                 "bans": r["bans"], "staff": r["staff"]} for r in rows]
+
+    def global_audit(self, limit: int = 200) -> list[dict]:
+        rows = self.db.query("SELECT a.*, c.title FROM audit a LEFT JOIN chats c ON c.chat_id=a.chat_id"
+                             " ORDER BY a.id DESC LIMIT ?", (limit,))
+        return [{"at": r["at"], "chat_id": r["chat_id"], "chat": r["title"] or (str(r["chat_id"]) if r["chat_id"] else "сервер"),
+                 "by": self.name(r["by_id"]) if r["by_id"] else "система", "action": r["action"],
+                 "detail": r["detail"], "source": r["source"]} for r in rows]
+
+    def find_users(self, q: str, limit: int = 30) -> list[dict]:
+        q = q.strip().lower().lstrip("@")
+        if not q:
+            return []
+        like = f"%{q}%"
+        rows = self.db.query(
+            "SELECT user_id, username, first_name, last_name FROM users WHERE LOWER(COALESCE(username,'')) LIKE ?"
+            " OR LOWER(COALESCE(first_name,'')) LIKE ? OR LOWER(COALESCE(last_name,'')) LIKE ?"
+            " OR CAST(user_id AS TEXT) LIKE ? ORDER BY user_id LIMIT ?", (like, like, like, like, limit))
+        out = []
+        for r in rows:
+            uid = r["user_id"]
+            out.append({
+                "user_id": uid, "name": full_name(r["first_name"], r["last_name"], r["username"], uid),
+                "username": r["username"],
+                "chats": self.db.scalar("SELECT COUNT(*) FROM members WHERE user_id=? AND left=0", (uid,), 0),
+                "bans": self.db.scalar("SELECT COUNT(*) FROM bans WHERE user_id=?", (uid,), 0),
+                "warns": self.db.scalar("SELECT COUNT(*) FROM warns WHERE user_id=? AND (expires_at=0 OR expires_at>?)",
+                                        (uid, now()), 0),
+                "admin": uid in self.super_admins,
+            })
+        return out
+
+    def add_panel_admin(self, uid: int, by: int) -> Result:
+        if uid <= 0:
+            return ERR("Некорректный ID")
+        if uid in self.owners:
+            return ERR("Этот пользователь уже владелец сервера.")
+        if self.db.one("SELECT 1 FROM panel_admins WHERE user_id=?", (uid,)):
+            return ERR("Уже администратор панели.")
+        self.db.execute("INSERT INTO panel_admins(user_id,added_by,at) VALUES(?,?,?)", (uid, by, now()))
+        self.audit(0, by, "админ панели +", str(uid), "web")
+        return OK("Администратор добавлен.")
+
+    def remove_panel_admin(self, uid: int, by: int) -> Result:
+        if uid in self.owners:
+            return ERR("Владельцев из .env через панель убрать нельзя.")
+        if not self.db.one("SELECT 1 FROM panel_admins WHERE user_id=?", (uid,)):
+            return ERR("Такого администратора нет.")
+        self.db.execute("DELETE FROM panel_admins WHERE user_id=?", (uid,))
+        self.db.execute("DELETE FROM web_sessions WHERE user_id=?", (uid,))
+        self.audit(0, by, "админ панели -", str(uid), "web")
+        return OK("Администратор удалён.")
+
+    async def global_punish(self, uid: int, by: int, ban: bool, reason: str = "") -> Result:
+        """Бан / разбан пользователя во всех активных чатах этого сервера."""
+        if uid in self.super_admins or uid == self.me_id:
+            return ERR("Администраторов сервера и бота банить нельзя.")
+        ok = fail = 0
+        for r in self.db.query("SELECT chat_id FROM chats WHERE active=1"):
+            if ban:
+                res = await self.ban(r["chat_id"], uid, 0, None, reason or "глобальный бан сервера", "web")
+            else:
+                res = await self.unban(r["chat_id"], uid, 0, "web")
+            ok, fail = (ok + 1, fail) if res.ok else (ok, fail + 1)
+        self.audit(0, by, "глобальный бан" if ban else "глобальный разбан", f"{uid}: ok={ok} fail={fail} {reason}"[:200], "web")
+        return OK(f"{'Забанен' if ban else 'Разбанен'} в чатах: {ok}, не удалось: {fail}.")
+
+    async def broadcast(self, text: str, by: int) -> Result:
+        sent = fail = 0
+        for r in self.db.query("SELECT chat_id FROM chats WHERE active=1"):
+            ok, _ = await self._tg(self.bot.send_message(r["chat_id"], esc(text)))
+            if ok:
+                sent += 1
+            else:
+                fail += 1
+            await asyncio.sleep(0.05)
+        self.audit(0, by, "рассылка", f"отправлено {sent}, ошибок {fail}", "web")
+        return OK(f"Рассылка: отправлено {sent}, ошибок {fail}.")
+
+    async def leave_chat(self, chat_id: int, by: int) -> Result:
+        ok, err = await self._tg(self.bot.leave_chat(chat_id))
+        self.db.execute("UPDATE chats SET active=0 WHERE chat_id=?", (chat_id,))
+        self.audit(chat_id, by, "бот покинул чат", "" if ok else esc(err)[:100], "web")
+        return OK("Бот покинул чат." if ok else f"Чат скрыт, но Telegram ответил: {esc(err)}")
+
+    def restore_chat(self, chat_id: int, by: int) -> Result:
+        if not self.db.one("SELECT 1 FROM chats WHERE chat_id=?", (chat_id,)):
+            return ERR("Чат не найден")
+        self.db.execute("UPDATE chats SET active=1 WHERE chat_id=?", (chat_id,))
+        self.audit(chat_id, by, "чат восстановлен", "", "web")
+        return OK("Чат снова активен.")
 
     # ---------- фоновое обслуживание ----------
     # ---------- запрещённые слова ----------
