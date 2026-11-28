@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
-from .. import commands, registry  # commands: чтобы заполнить реестр команд
+from .. import __version__, commands, registry  # commands: чтобы заполнить реестр команд
 from ..core import DISABLED, SETTINGS, Core
 from ..utils import now, take_period
 
@@ -32,6 +32,26 @@ def create_app(core: Core) -> FastAPI:
 
     def is_super(uid: int) -> bool:
         return uid in core.super_admins
+
+    def is_owner(uid: int) -> bool:
+        return uid in core.owners
+
+    def require_super(uid: int) -> None:
+        if not is_super(uid):
+            raise HTTPException(403, "Раздел только для администраторов сервера")
+
+    def require_owner(uid: int) -> None:
+        if not is_owner(uid):
+            raise HTTPException(403, "Только для владельца сервера (OWNER_IDS в .env)")
+
+    def target_id(body: dict) -> int:
+        try:
+            uid = int(body.get("user_id"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Не указан пользователь")
+        if uid <= 0:
+            raise HTTPException(400, "Некорректный ID")
+        return uid
 
     def chat_rank(chat_id: int, uid: int) -> int:
         return 5 if is_super(uid) else core.rank_of(chat_id, uid)
@@ -90,7 +110,8 @@ def create_app(core: Core) -> FastAPI:
         chats = [{"chat_id": r["chat_id"], "title": core.db.scalar("SELECT title FROM chats WHERE chat_id=?",
                                                                    (r["chat_id"],)),
                   "rank": chat_rank(r["chat_id"], uid)} for r in rows]
-        return {"user_id": uid, "name": core.name(uid), "chats": chats}
+        return {"user_id": uid, "name": core.name(uid), "chats": chats, "is_super": is_super(uid),
+                "is_owner": is_owner(uid), "version": __version__}
 
     @app.get("/api/chats/{chat_id}/overview")
     async def overview(chat_id: int, uid: int = Depends(current_user)):
@@ -261,12 +282,95 @@ def create_app(core: Core) -> FastAPI:
         r = await core.kick_many(chat_id, ids, uid, "web")
         return {"ok": True, "text": _plain(r.text)}
 
+    # ---------- админка сервера: все чаты этого экземпляра бота ----------
+    @app.get("/api/admin/overview")
+    async def admin_overview(uid: int = Depends(current_user)):
+        require_super(uid)
+        o = core.admin_overview()
+        o["version"] = __version__
+        o["db_bytes"] = _db_size(core)
+        o["owners"] = len(core.owners)
+        return o
+
+    @app.get("/api/admin/chats")
+    async def admin_chats(q: str = "", inactive: int = 0, uid: int = Depends(current_user)):
+        require_super(uid)
+        return core.admin_chats(q.strip()[:64], bool(inactive))
+
+    @app.post("/api/admin/chats/{chat_id}/leave")
+    async def admin_leave(chat_id: int, uid: int = Depends(current_user)):
+        require_owner(uid)
+        r = await core.leave_chat(chat_id, uid)
+        return {"ok": r.ok, "text": _plain(r.text)}
+
+    @app.post("/api/admin/chats/{chat_id}/restore")
+    async def admin_restore(chat_id: int, uid: int = Depends(current_user)):
+        require_owner(uid)
+        r = core.restore_chat(chat_id, uid)
+        return {"ok": r.ok, "text": _plain(r.text)}
+
+    @app.get("/api/admin/admins")
+    async def admin_admins(uid: int = Depends(current_user)):
+        require_super(uid)
+        rows = core.db.query("SELECT user_id, added_by, at FROM panel_admins ORDER BY at")
+        return {"owners": [{"user_id": i, "name": core.name(i)} for i in sorted(core.owners)],
+                "admins": [{"user_id": r["user_id"], "name": core.name(r["user_id"]), "at": r["at"],
+                            "by": core.name(r["added_by"]) if r["added_by"] else "—"} for r in rows],
+                "can_edit": is_owner(uid)}
+
+    @app.post("/api/admin/admins")
+    async def admin_add(body: dict = Body(...), uid: int = Depends(current_user)):
+        require_owner(uid)
+        r = core.add_panel_admin(target_id(body), uid)
+        return {"ok": r.ok, "text": _plain(r.text)}
+
+    @app.post("/api/admin/admins/remove")
+    async def admin_remove(body: dict = Body(...), uid: int = Depends(current_user)):
+        require_owner(uid)
+        r = core.remove_panel_admin(target_id(body), uid)
+        return {"ok": r.ok, "text": _plain(r.text)}
+
+    @app.get("/api/admin/audit")
+    async def admin_audit(uid: int = Depends(current_user)):
+        require_super(uid)
+        return core.global_audit(200)
+
+    @app.get("/api/admin/users")
+    async def admin_users(q: str = "", uid: int = Depends(current_user)):
+        require_super(uid)
+        return core.find_users(q[:64])
+
+    @app.post("/api/admin/global_ban")
+    async def admin_global_ban(body: dict = Body(...), uid: int = Depends(current_user)):
+        require_owner(uid)
+        r = await core.global_punish(target_id(body), uid, ban=bool(body.get("ban", True)),
+                                     reason=str(body.get("reason", ""))[:200])
+        return {"ok": r.ok, "text": _plain(r.text)}
+
+    @app.post("/api/admin/broadcast")
+    async def admin_broadcast(body: dict = Body(...), uid: int = Depends(current_user)):
+        require_owner(uid)
+        text = str(body.get("text", "")).strip()
+        if not text or len(text) > 3500:
+            raise HTTPException(400, "Текст: от 1 до 3500 символов")
+        r = await core.broadcast(text, uid)
+        return {"ok": r.ok, "text": _plain(r.text)}
+
     # ---------- страница ----------
     @app.get("/")
     async def index():
         return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-store"})
 
     return app
+
+
+def _db_size(core: Core) -> int:
+    import os
+    path = core.config.db_path if core.config else ""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
 
 
 def _plain(html_text: str) -> str:

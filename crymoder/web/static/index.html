@@ -86,6 +86,8 @@ function ask(title,fields,ok="Применить"){
   });
 }
 const TABS=[["overview","Обзор"],["members","Участники"],["punish","Наказания"],["staff","Модераторы"],["clean","Чистка"],["settings","Настройки"],["access","Доступ команд"],["audit","Журнал"]];
+const ADMIN_TABS=[["ov","Сервер"],["chats","Все чаты"],["users","Пользователи"],["admins","Администраторы"],["log","Общий журнал"],["bc","Рассылка"]];
+const tabs=()=>S.me&&S.me.is_super?[...TABS,["admin","⚙ Админка"]]:TABS;
 
 async function boot(){
   try{S.me=await api("/me");if(!S.chat&&S.me.chats.length)S.chat=S.me.chats[0].chat_id}catch(e){S.me=null}
@@ -94,18 +96,21 @@ async function boot(){
 function render(){
   const app=$("#app");
   if(!S.me){app.innerHTML=`<div class="login card"><h2>CRYMODER</h2><p class="mute">Вход только через бота. Напишите ему в личные сообщения слово <b>панель</b> — он пришлёт одноразовую ссылку.</p></div>`;return}
-  if(!S.me.chats.length){app.innerHTML=`<header><h1>CRYMODER</h1><span class="sp"></span><span>${esc(S.me.name)}</span></header><main><div class="card empty">У вас нет чатов, где вы модератор. Добавьте бота в чат и получите ранг командой «+модер».</div></main>`;return}
+  const sup=S.me.is_super;
+  if(!S.me.chats.length&&!sup){app.innerHTML=`<header><h1>CRYMODER</h1><span class="sp"></span><span>${esc(S.me.name)}</span></header><main><div class="card empty">У вас нет чатов, где вы модератор. Добавьте бота в чат и получите ранг командой «+модер».</div></main>`;return}
+  if(!S.me.chats.length)S.tab="admin";
+  const tb=sup?tabs().filter(t=>S.me.chats.length||t[0]==="admin"):TABS;
   app.innerHTML=`<header><h1>CRYMODER</h1>
-    <select id="chatsel">${S.me.chats.map(c=>`<option value="${c.chat_id}" ${c.chat_id==S.chat?"selected":""}>${esc(c.title||c.chat_id)} · ${c.rank} ранг</option>`).join("")}</select>
-    <span class="sp"></span><span class="mute">${esc(S.me.name)}</span><button id="out">Выйти</button></header>
-    <nav>${TABS.map(t=>`<button data-t="${t[0]}" class="${S.tab===t[0]?"on":""}">${t[1]}</button>`).join("")}</nav><main id="view"></main>`;
-  $("#chatsel").onchange=e=>{S.chat=+e.target.value;S.page=0;S.q="";show()};
+    ${S.me.chats.length?`<select id="chatsel">${S.me.chats.map(c=>`<option value="${c.chat_id}" ${c.chat_id==S.chat?"selected":""}>${esc(c.title||c.chat_id)} · ${c.rank} ранг</option>`).join("")}</select>`:""}
+    <span class="sp"></span><span class="mute">${esc(S.me.name)} · v${esc(S.me.version||"")}</span><button id="out">Выйти</button></header>
+    <nav>${tb.map(t=>`<button data-t="${t[0]}" class="${S.tab===t[0]?"on":""}">${t[1]}</button>`).join("")}</nav><main id="view"></main>`;
+  if($("#chatsel"))$("#chatsel").onchange=e=>{S.chat=+e.target.value;S.page=0;S.q="";show()};
   $("#out").onclick=async()=>{await api("/logout",{});S.me=null;render()};
   document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{S.tab=b.dataset.t;S.page=0;render();show()});
   show();
 }
 async function show(){
-  const v=$("#view");if(!v||!S.chat)return;
+  const v=$("#view");if(!v||(!S.chat&&S.tab!=="admin"))return;
   try{await VIEWS[S.tab](v)}catch(e){if(e.message!=="auth")v.innerHTML=`<div class="card empty">${esc(e.message)}</div>`}
 }
 const rankBadge=r=>r?`<span class="chip ok">${RANKS[r]} (${r})</span>`:"";
@@ -179,6 +184,65 @@ async access(v){
 async audit(v){
   const d=await api(`/chats/${S.chat}/audit`);
   v.innerHTML=`<div class="card tablewrap"><table><thead><tr><th>Время</th><th>Кто</th><th>Действие</th><th>Детали</th><th>Откуда</th></tr></thead><tbody>${d.map(r=>`<tr><td>${fmt(r.at)}</td><td>${esc(r.by)}</td><td>${esc(r.action)}</td><td>${esc(r.detail)}</td><td><span class="chip">${r.source==="web"?"панель":"чат"}</span></td></tr>`).join("")||`<tr><td colspan=5 class="empty">Журнал пуст</td></tr>`}</tbody></table></div>`;
+},
+async admin(v){
+  S.sub=S.sub||"ov";
+  v.innerHTML=`<div class="row">${ADMIN_TABS.map(t=>`<button data-s="${t[0]}" class="${S.sub===t[0]?"pri":""}">${t[1]}</button>`).join("")}</div><div id="sub"></div>`;
+  v.querySelectorAll("button[data-s]").forEach(b=>b.onclick=()=>{S.sub=b.dataset.s;S.aq="";show()});
+  const sv=$("#sub");
+  try{await ADMIN[S.sub](sv)}catch(e){if(e.message!=="auth")sv.innerHTML=`<div class="card empty">${esc(e.message)}</div>`}
+}};
+const bytes=n=>n>1048576?(n/1048576).toFixed(1)+" МБ":Math.max(1,Math.round(n/1024))+" КБ";
+const ADMIN={
+async ov(v){
+  const o=await api("/admin/overview");
+  v.innerHTML=`<p class="mute" style="margin-top:0">Это ваш собственный сервер: свои чаты, своя база и свои администраторы. Данные других установок CRYMODER сюда не попадают.</p>
+  <div class="grid">${[["Чатов",o.chats],["Участников",o.members],["Пользователей в базе",o.users],["Сообщений сегодня",o.msgs_today],["За 7 дней",o.msgs_week],["Банов",o.bans],["Мутов",o.mutes],["Предупреждений",o.warns],["Модераторов",o.staff],["Сессий панели",o.sessions]].map(x=>`<div class="card stat"><b>${x[1]}</b><span>${x[0]}</span></div>`).join("")}</div>
+  <div class="card"><div class="row"><span class="chip">версия ${esc(o.version)}</span><span class="chip">база: ${bytes(o.db_bytes)}</span><span class="chip">владельцев: ${o.owners}</span><span class="chip">админов панели: ${o.panel_admins}</span>${o.chats_inactive?`<span class="chip warn">скрытых чатов: ${o.chats_inactive}</span>`:""}</div>
+  <p class="mute" style="margin:0">Обновление и смена домена — на сервере командой <code>crymoder</code>.</p></div>`;
+},
+async chats(v){
+  const d=await api(`/admin/chats?q=${encodeURIComponent(S.aq||"")}&inactive=${S.ainact?1:0}`);
+  const owner=S.me.is_owner;
+  v.innerHTML=`<div class="row"><input id="aq" type="text" placeholder="Название, ID или код чата" value="${esc(S.aq||"")}" style="flex:1;min-width:200px"><button id="go" class="pri">Найти</button><label class="mute"><input type="checkbox" id="inact" ${S.ainact?"checked":""}> скрытые</label><span class="mute">Всего: ${d.length}</span></div>
+  <div class="card tablewrap"><table><thead><tr><th>Чат</th><th>Участн.</th><th>Сообщ. 7д</th><th>Баны</th><th>Модер.</th><th>Создатель</th><th></th></tr></thead><tbody>
+  ${d.map(c=>`<tr><td><b>${esc(c.title)}</b><br><span class="mute">${c.chat_id} · ${esc(c.code)}</span></td><td>${c.members}</td><td>${c.msgs_week}</td><td>${c.bans}</td><td>${c.staff}</td><td>${esc(c.creator)}</td>
+  <td style="white-space:nowrap">${S.ainact?(owner?`<button data-r="${c.chat_id}">Восстановить</button>`:""):`<button data-o="${c.chat_id}">Открыть</button> ${owner?`<button class="dng" data-l="${c.chat_id}" data-n="${esc(c.title)}">Покинуть</button>`:""}`}</td></tr>`).join("")||`<tr><td colspan=7 class="empty">Чатов нет</td></tr>`}</tbody></table></div>`;
+  const go=()=>{S.aq=$("#aq").value;show()};$("#go").onclick=go;$("#aq").onkeydown=e=>e.key==="Enter"&&go();
+  $("#inact").onchange=e=>{S.ainact=e.target.checked;show()};
+  v.querySelectorAll("button[data-o]").forEach(b=>b.onclick=()=>{S.chat=+b.dataset.o;S.tab="overview";render()});
+  v.querySelectorAll("button[data-l]").forEach(b=>b.onclick=()=>confirm(`Бот покинет «${b.dataset.n}». Продолжить?`)&&run(`/admin/chats/${b.dataset.l}/leave`,{}));
+  v.querySelectorAll("button[data-r]").forEach(b=>b.onclick=()=>run(`/admin/chats/${b.dataset.r}/restore`,{}));
+},
+async users(v){
+  const d=S.aq?await api(`/admin/users?q=${encodeURIComponent(S.aq)}`):[];
+  const owner=S.me.is_owner;
+  v.innerHTML=`<div class="row"><input id="aq" type="text" placeholder="Имя, @ник или ID" value="${esc(S.aq||"")}" style="flex:1;min-width:200px"><button id="go" class="pri">Найти</button></div>
+  <div class="card tablewrap"><table><thead><tr><th>Пользователь</th><th>Чатов</th><th>Банов</th><th>Варнов</th><th></th></tr></thead><tbody>
+  ${d.map(u=>`<tr><td><b>${esc(u.name)}</b>${u.username?` <span class="mute">@${esc(u.username)}</span>`:""}${u.admin?` <span class="chip ok">админ</span>`:""}<br><span class="mute">${u.user_id}</span></td><td>${u.chats}</td><td>${u.bans}</td><td>${u.warns}</td>
+  <td style="white-space:nowrap">${owner&&!u.admin?`<button class="dng" data-b="${u.user_id}" data-n="${esc(u.name)}">Бан везде</button> <button data-u="${u.user_id}">Разбан везде</button>`:""}</td></tr>`).join("")||`<tr><td colspan=5 class="empty">${S.aq?"Никого не найдено":"Введите запрос"}</td></tr>`}</tbody></table></div>`;
+  const go=()=>{S.aq=$("#aq").value;show()};$("#go").onclick=go;$("#aq").onkeydown=e=>e.key==="Enter"&&go();
+  v.querySelectorAll("button[data-b]").forEach(b=>b.onclick=async()=>{const r=await ask("Бан во всех чатах: "+b.dataset.n,[{name:"reason",label:"Причина",ph:"спам-рассылка"}],"Забанить везде");if(r)run("/admin/global_ban",{user_id:+b.dataset.b,ban:true,reason:r.reason},false)});
+  v.querySelectorAll("button[data-u]").forEach(b=>b.onclick=()=>confirm("Разблокировать во всех чатах сервера?")&&run("/admin/global_ban",{user_id:+b.dataset.u,ban:false},false));
+},
+async admins(v){
+  const d=await api("/admin/admins");
+  v.innerHTML=`<p class="mute" style="margin-top:0">Владельцы задаются в <code>.env</code> (<code>OWNER_IDS</code>) при установке. Администраторы панели видят все чаты сервера, но не могут менять администраторов, делать глобальные баны и рассылки.</p>
+  <div class="sect">Владельцы</div><div class="card tablewrap"><table><tbody>${d.owners.map(o=>`<tr><td><b>${esc(o.name)}</b><br><span class="mute">${o.user_id}</span></td></tr>`).join("")||`<tr><td class="empty">Не заданы</td></tr>`}</tbody></table></div>
+  <div class="sect">Администраторы панели</div>${d.can_edit?`<div class="row"><button id="add" class="pri">+ Добавить по ID</button></div>`:""}
+  <div class="card tablewrap"><table><tbody>${d.admins.map(a=>`<tr><td><b>${esc(a.name)}</b><br><span class="mute">${a.user_id}</span></td><td>добавил: ${esc(a.by)}</td><td>${fmt(a.at)}</td><td>${d.can_edit?`<button class="dng" data-x="${a.user_id}">Убрать</button>`:""}</td></tr>`).join("")||`<tr><td class="empty">Нет</td></tr>`}</tbody></table></div>`;
+  if($("#add"))$("#add").onclick=async()=>{const r=await ask("Новый администратор панели",[{name:"u",label:"Telegram ID (число; узнать — команда /id)",ph:"123456789"}]);if(r)run("/admin/admins",{user_id:+r.u})};
+  v.querySelectorAll("button[data-x]").forEach(b=>b.onclick=()=>confirm("Убрать администратора?")&&run("/admin/admins/remove",{user_id:+b.dataset.x}));
+},
+async log(v){
+  const d=await api("/admin/audit");
+  v.innerHTML=`<div class="card tablewrap"><table><thead><tr><th>Время</th><th>Чат</th><th>Кто</th><th>Действие</th><th>Детали</th></tr></thead><tbody>${d.map(r=>`<tr><td>${fmt(r.at)}</td><td>${esc(r.chat)}</td><td>${esc(r.by)}</td><td>${esc(r.action)}</td><td>${esc(r.detail)}</td></tr>`).join("")||`<tr><td colspan=5 class="empty">Журнал пуст</td></tr>`}</tbody></table></div>`;
+},
+async bc(v){
+  if(!S.me.is_owner){v.innerHTML=`<div class="card empty">Рассылка доступна только владельцу сервера.</div>`;return}
+  v.innerHTML=`<div class="card"><p class="mute" style="margin-top:0">Сообщение уйдёт во все активные чаты этого сервера от имени бота (простой текст).</p><textarea id="bt" rows="5" style="width:100%" maxlength="3500"></textarea>
+  <div class="row" style="margin:12px 0 0"><button id="send" class="pri">Отправить во все чаты</button></div></div>`;
+  $("#send").onclick=()=>{const t=$("#bt").value.trim();if(t&&confirm("Отправить сообщение во все чаты?"))run("/admin/broadcast",{text:t},false).then(()=>{$("#bt").value=""})};
 }};
 function ctl(s){
   const k=`data-k="${s.key}" data-t="${s.type}"`;
