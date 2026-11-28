@@ -311,6 +311,10 @@ open_firewall() {
   fi
   return 0
 }
+certbot_has_nginx() { # certbot может стоять без плагина nginx (snap, pip, голый пакет)
+  local out; out="$(sys certbot plugins 2>/dev/null || true)"
+  [[ "$out" == *nginx* ]]
+}
 panel_port() { # в docker порт на хосте зафиксирован в docker-compose.yml
   local p; [ "$MODE" = docker ] && { echo 8000; return; }
   p="$(env_get WEB_PORT)"; [[ "$p" =~ ^[0-9]+$ ]] || p=8000; echo "$p"
@@ -357,10 +361,13 @@ setup_domain() { # домен [email]
     info "DNS в порядке: $domain → ${dns_ip}"
   fi
 
-  if ! have nginx || ! have certbot; then
-    info "Устанавливаю nginx и certbot"
-    pkg_install nginx certbot python3-certbot-nginx || die "Не удалось установить nginx/certbot."
+  have nginx   || { info "Устанавливаю nginx";   pkg_install nginx   || die "Не удалось установить nginx."; }
+  have certbot || { info "Устанавливаю certbot"; pkg_install certbot || die "Не удалось установить certbot."; }
+  if ! certbot_has_nginx; then
+    info "Устанавливаю плагин certbot для nginx"
+    pkg_install python3-certbot-nginx || true
   fi
+  certbot_has_nginx || die "У certbot нет плагина nginx (certbot поставлен не из пакетов дистрибутива?). Установите python3-certbot-nginx или certbot из apt/snap и повторите: crymoder domain $domain"
   has_systemd && sys systemctl enable --now nginx >/dev/null 2>&1 || true
 
   port="$(panel_port)"

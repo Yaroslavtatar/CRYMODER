@@ -58,6 +58,14 @@ def test_parse_sender_id_ignores_groups():
     assert bash('parse_sender_id <<<"$J"', env={"J": '{"ok":true,"result":[]}'}).stdout.strip() == ""
 
 
+def test_certbot_plugin_detection():
+    with_plugin = 'sys() { echo "* nginx\\nDescription: Nginx Web Server plugin"; }'
+    without = 'sys() { echo "* apache\\n* standalone\\n* webroot"; }'
+    assert bash(f"{with_plugin}\ncertbot_has_nginx").returncode == 0
+    assert bash(f"{without}\ncertbot_has_nginx").returncode == 1
+    assert bash("sys() { return 1; }\ncertbot_has_nginx").returncode == 1
+
+
 def test_nginx_conf_generation(tmp_path):
     out = tmp_path / "crymoder.conf"
     r = bash(f'''sys() {{ "$@"; }}
