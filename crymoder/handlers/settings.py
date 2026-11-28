@@ -1,97 +1,92 @@
-from __future__ import annotations
+"""Инлайн-панель /settings: переключатели автомодерации. Данные хранятся в общей таблице настроек,
+поэтому то же самое можно менять и командами, и в веб-панели."""
+from aiogram import F, Router
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
-from aiogram import Bot, F, Router
-from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-
-from ..db import DEFAULTS, RANGES, WARN_ACTIONS, Database
-from ..utils import can_restrict, is_anonymous_admin
+from ..core import RANGES, Core
+from ..utils import fmt_duration
 
 router = Router(name="settings")
-GROUP = F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP})
+
+TITLE = "⚙️ <b>Настройки автомодерации</b>\nНажимайте кнопки, чтобы переключать."
 
 TOGGLES = [
     ("antiflood", "Антифлуд"),
-    ("antiinvite", "Анти-инвайты"),
-    ("antilink", "Анти-ссылки"),
+    ("antilink", "Запрет ссылок"),
+    ("antiinvite", "Запрет инвайт-ссылок"),
     ("badwords", "Фильтр слов"),
-    ("captcha", "Капча для новичков"),
-    ("delete_service", "Удалять «вошёл/вышел»"),
+    ("captcha", "Капча новичкам"),
+    ("delete_service", "Удалять служебные сообщения"),
 ]
 NUMBERS = [
-    ("max_warns", "Предупреждений до наказания", 1),
+    ("warn_limit", "Варнов до наказания", 1),
     ("flood_limit", "Флуд: сообщений", 1),
     ("captcha_timeout", "Время на капчу, с", 30),
 ]
-ACTION_NAMES = {"mute": "мут 24ч", "ban": "бан", "kick": "кик"}
-TITLE = "⚙️ <b>Настройки CRYMODER</b>\nНажимайте кнопки, чтобы переключать параметры."
+_ACTION_ORDER = ["mute", "ban", "kick"]
+_ACTION_NAMES = {"mute": "мут", "ban": "бан", "kick": "кик"}
+_KEYS = {k for k, _ in TOGGLES} | {k for k, _, _ in NUMBERS}
 
 
-def build_keyboard(s: dict) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=f"{'✅' if s[key] else '❌'} {label}", callback_data=f"set:t:{key}")]
-        for key, label in TOGGLES
-    ]
-    for key, label, step in NUMBERS:
+def _action_label(core: Core, chat_id: int) -> str:
+    act = core.get(chat_id, "warn_action")
+    label = _ACTION_NAMES.get(act, act)
+    if act == "mute":
+        label += " " + fmt_duration(core.get(chat_id, "warn_mute_secs") or 86400)
+    return label
+
+
+def build_keyboard(core: Core, chat_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    for key, title in TOGGLES:
+        mark = "✅" if core.get(chat_id, key) else "❌"
+        rows.append([InlineKeyboardButton(text=f"{mark} {title}", callback_data=f"set:t:{key}")])
+    for key, title, step in NUMBERS:
         rows.append([
             InlineKeyboardButton(text="➖", callback_data=f"set:n:{key}:-{step}"),
-            InlineKeyboardButton(text=f"{label}: {s[key]}", callback_data="set:noop"),
+            InlineKeyboardButton(text=f"{title}: {core.get(chat_id, key)}", callback_data="set:noop"),
             InlineKeyboardButton(text="➕", callback_data=f"set:n:{key}:{step}"),
         ])
-    rows.append([
-        InlineKeyboardButton(
-            text=f"При лимите предупреждений: {ACTION_NAMES[s['warn_action']]}",
-            callback_data="set:c:warn_action",
-        )
-    ])
+    rows.append([InlineKeyboardButton(text=f"При лимите варнов: {_action_label(core, chat_id)}",
+                                      callback_data="set:c:warn_action")])
     rows.append([InlineKeyboardButton(text="Закрыть", callback_data="set:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-@router.message(GROUP, Command("settings"))
-async def cmd_settings(message: Message, bot: Bot, db: Database) -> None:
-    allowed = is_anonymous_admin(message) or (
-        message.from_user and await can_restrict(bot, message.chat.id, message.from_user.id)
-    )
-    if not allowed:
-        return
-    settings = await db.get_settings(message.chat.id)
-    await message.answer(TITLE, reply_markup=build_keyboard(settings))
-
-
 @router.callback_query(F.data.startswith("set:"))
-async def on_setting(call: CallbackQuery, bot: Bot, db: Database) -> None:
-    if not call.message:
+async def on_setting(call: CallbackQuery, core: Core):
+    msg = call.message
+    if not msg:
         return await call.answer()
-    chat_id = call.message.chat.id
-    if not await can_restrict(bot, chat_id, call.from_user.id):
-        return await call.answer("Только для админов.", show_alert=True)
-
+    chat_id = msg.chat.id
+    if not core.has_access(chat_id, call.from_user.id, "настройки"):
+        return await call.answer("Недостаточно прав.", show_alert=True)
     parts = call.data.split(":")
-    action = parts[1]
-    if action == "noop":
+    kind = parts[1]
+    if kind == "noop":
         return await call.answer()
-    if action == "close":
-        await call.message.delete()
+    if kind == "close":
+        await call.answer()
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        return
+    key = parts[2] if len(parts) > 2 else ""
+    if kind == "t" and key in _KEYS:
+        core.set_setting(chat_id, key, 0 if core.get(chat_id, key) else 1, call.from_user.id, "chat")
+    elif kind == "n" and key in _KEYS:
+        lo, hi = RANGES.get(key, (0, 10**6))
+        new = min(max(core.get(chat_id, key) + int(parts[3]), lo), hi)
+        core.set_setting(chat_id, key, new, call.from_user.id, "chat")
+    elif kind == "c" and key == "warn_action":
+        cur = core.get(chat_id, "warn_action")
+        nxt = _ACTION_ORDER[(_ACTION_ORDER.index(cur) + 1) % len(_ACTION_ORDER)] if cur in _ACTION_ORDER else "mute"
+        core.set_setting(chat_id, "warn_action", nxt, call.from_user.id, "chat")
+    else:
         return await call.answer()
-
-    settings = await db.get_settings(chat_id)
-    key = parts[2]
-    if key not in DEFAULTS:
-        return await call.answer()
-
-    if action == "t":
-        await db.set_setting(chat_id, key, 0 if settings[key] else 1)
-    elif action == "n" and key in RANGES:
-        await db.set_setting(chat_id, key, settings[key] + int(parts[3]))
-    elif action == "c" and key == "warn_action":
-        nxt = WARN_ACTIONS[(WARN_ACTIONS.index(settings[key]) + 1) % len(WARN_ACTIONS)]
-        await db.set_setting(chat_id, key, nxt)
-
     try:
-        await call.message.edit_reply_markup(reply_markup=build_keyboard(await db.get_settings(chat_id)))
-    except TelegramBadRequest:  # значение не изменилось (упёрлись в границу)
-        pass
+        await msg.edit_reply_markup(reply_markup=build_keyboard(core, chat_id))
+    except Exception:
+        pass   # «message is not modified» и подобное
     await call.answer()

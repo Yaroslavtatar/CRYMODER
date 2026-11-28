@@ -18,5 +18,6 @@ COPY crymoder ./crymoder
 
 USER crymoder
 VOLUME /data
+EXPOSE 8000
 
 CMD ["python", "-m", "crymoder"]

@@ -1,4 +1,5 @@
-"""Подключение к Telegram: события, учёт активности, защита чата, фоновые задачи."""
+"""События Telegram: единый конвейер групповых сообщений (учёт → защита → автомодерация → команды),
+входы и выходы (с капчей), заявки, голосования, фоновые задачи."""
 import asyncio
 import logging
 import re
@@ -8,13 +9,14 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import CallbackQuery, ChatJoinRequest, ChatMemberUpdated, Message
 
-from . import handlers
-from .core import Core
-from .util import now, today_str
+from .. import commands
+from ..config import Config
+from ..core import Core
+from ..utils import now, today_str
+from . import automod, captcha, settings
 
-log = logging.getLogger("iris.bot")
-router = Router()
-_core: Core = None  # type: ignore
+log = logging.getLogger("crymoder.events")
+router = Router(name="events")
 
 JOINED = {"member", "restricted", "administrator", "creator"}
 GONE = {"left", "kicked"}
@@ -99,33 +101,39 @@ async def enforce(core: Core, bot: Bot, msg) -> bool:
 
 # ---------------------------------------------------------------- события
 @router.message(F.chat.type.in_({"group", "supergroup"}))
-async def on_group_message(msg: Message):
-    core = _core
-    track_message(core, msg)
-    if await enforce(core, msg.bot, msg):
+async def on_group_message(msg: Message, bot: Bot, core: Core):
+    # служебные «вошёл / вышел»: не статистика и не команды
+    if msg.new_chat_members or msg.left_chat_member:
+        core.ensure_chat(msg.chat.id, msg.chat.title or "")
+        if core.get(msg.chat.id, "delete_service"):
+            await core._tg(msg.delete())
         return
-    await handlers.handle_message(core, msg.bot, msg)
+    track_message(core, msg)
+    if await enforce(core, bot, msg):            # ссылки / каналы по настройкам -ссылки, -сайты...
+        return
+    if await automod.check(core, bot, msg):      # антифлуд, инвайты, слова
+        return
+    await commands.handle_message(core, bot, msg)
 
 
 @router.message(F.chat.type == "private")
-async def on_private_message(msg: Message):
+async def on_private_message(msg: Message, bot: Bot, core: Core):
     if msg.from_user:
-        _core.reg_user(msg.from_user)
+        core.reg_user(msg.from_user)
     text = (msg.text or "").strip()
     if text.lower() == "/start":
         text = "/помощь"
         msg = msg.model_copy(update={"text": text})
-    await handlers.handle_message(_core, msg.bot, msg)
+    await commands.handle_message(core, bot, msg)
 
 
 @router.my_chat_member()
-async def on_my_status(upd: ChatMemberUpdated):
-    core = _core
+async def on_my_status(upd: ChatMemberUpdated, core: Core):
     if upd.chat.type not in ("group", "supergroup"):
         return
     if upd.new_chat_member.status in JOINED:
         core.ensure_chat(upd.chat.id, upd.chat.title or "")
-        await core.sync_creator(upd.chat.id)
+        await core.sync_admins(upd.chat.id)
         if upd.new_chat_member.status != "administrator":
             await core._tg(upd.bot.send_message(
                 upd.chat.id, "Привет! Сделайте меня администратором (с правами на удаление сообщений, блокировку "
@@ -135,8 +143,8 @@ async def on_my_status(upd: ChatMemberUpdated):
 
 
 @router.chat_member()
-async def on_member_update(upd: ChatMemberUpdated):
-    core, bot = _core, upd.bot
+async def on_member_update(upd: ChatMemberUpdated, core: Core):
+    bot = upd.bot
     chat_id = upd.chat.id
     user = upd.new_chat_member.user
     old, new = upd.old_chat_member.status, upd.new_chat_member.status
@@ -144,6 +152,8 @@ async def on_member_update(upd: ChatMemberUpdated):
     is_in = new in JOINED and not (new == "restricted" and not getattr(upd.new_chat_member, "is_member", True))
     core.ensure_chat(chat_id, upd.chat.title or "")
     core.reg_user(user)
+    if "administrator" in (old, new) or "creator" in (old, new):
+        await core.sync_admins(chat_id)        # назначили / сняли админа в Telegram → обновляем ранги
     if not was_in and is_in:
         await on_join(core, bot, upd, user)
     elif was_in and not is_in:
@@ -180,18 +190,22 @@ async def on_join(core: Core, bot: Bot, upd, user):
             r = await core.kick(chat_id, inviter, 0, "превышен лимит приглашений", "auto")
             if r.ok:
                 await core._tg(bot.send_message(chat_id, "🚫 Превышен лимит приглашений. " + r.text))
+    # капча новичкам (не ботам и не модераторам)
+    if not user.is_bot and core.get(chat_id, "captcha") and core.rank_of(chat_id, user.id) < 1:
+        await captcha.start(core, bot, chat_id, user)
     if core.get(chat_id, "show_joins") and not user.is_bot:
         await core._tg(bot.send_message(chat_id, f"➕ {core.m(user.id)} вошёл(а) в чат."))
     tpl = core.get(chat_id, "greeting")
     if tpl and user.id != core.me_id:
         prof = core.db.one("SELECT gender FROM profiles WHERE chat_id=? AND user_id=?", (chat_id, user.id))
-        text = handlers.render_greeting(tpl, core.m(user.id), (prof["gender"] if prof and prof["gender"] else "м"))
+        text = commands.render_greeting(tpl, core.m(user.id), (prof["gender"] if prof and prof["gender"] else "м"))
         await core._tg(bot.send_message(chat_id, text))
 
 
 async def on_leave(core: Core, bot: Bot, upd, user, kicked: bool):
     chat_id, t = upd.chat.id, now()
     core.db.execute("UPDATE members SET left=1 WHERE chat_id=? AND user_id=?", (chat_id, user.id))
+    await captcha.forget(core, bot, chat_id, user.id)
     if kicked:
         return
     core.db.execute("INSERT INTO leaves(chat_id,user_id,at) VALUES(?,?,?)", (chat_id, user.id, t))
@@ -210,8 +224,7 @@ async def on_leave(core: Core, bot: Bot, upd, user, kicked: bool):
 
 
 @router.chat_join_request()
-async def on_join_request(req: ChatJoinRequest):
-    core = _core
+async def on_join_request(req: ChatJoinRequest, core: Core):
     chat_id = req.chat.id
     core.ensure_chat(chat_id, req.chat.title or "")
     if not core.get(chat_id, "auto_requests"):
@@ -227,8 +240,8 @@ async def on_join_request(req: ChatJoinRequest):
 
 
 @router.callback_query(F.data.startswith("gb:"))
-async def on_vote(cq: CallbackQuery):
-    await handlers.vote_callback(_core, cq.bot, cq)
+async def on_vote(cq: CallbackQuery, core: Core):
+    await commands.vote_callback(core, cq.bot, cq)
 
 
 # ---------------------------------------------------------------- фон
@@ -241,6 +254,7 @@ async def maintenance_loop(core: Core, bot: Bot):
             tick += 1
             if tick % 120 == 0:  # раз в час
                 for r in core.db.query("SELECT chat_id FROM chats WHERE active=1"):
+                    await core.sync_admins(r["chat_id"])
                     secs = core.get(r["chat_id"], "autokick_silent_secs")
                     if secs > 0:
                         ids = core.inactive_ids(r["chat_id"], only_silent=True, period=secs)
@@ -252,9 +266,8 @@ async def maintenance_loop(core: Core, bot: Bot):
             log.exception("maintenance failed")
 
 
-def build_dispatcher(core: Core) -> Dispatcher:
-    global _core
-    _core = core
-    dp = Dispatcher()
-    dp.include_router(router)
+def build_dispatcher(core: Core, config: Config | None = None) -> Dispatcher:
+    """Один диспетчер на всё: настройки и капча (callback-кнопки), затем общий конвейер событий."""
+    dp = Dispatcher(core=core, config=config)
+    dp.include_routers(settings.router, captcha.router, router)
     return dp

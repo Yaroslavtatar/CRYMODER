@@ -1,22 +1,19 @@
-"""Автомодерация: антифлуд, ссылки, инвайты, запрещённые слова. Регистрируется последней."""
+"""Автомодерация: антифлуд, ссылки, инвайты, запрещённые слова. Вызывается из общего конвейера сообщений
+(events.on_group_message) после защиты чата и до разбора команд. Наказания идут через Core (варны, муты),
+поэтому лимит предупреждений, ранги и журнал у автомодерации и ручных команд общие."""
 from __future__ import annotations
 
 import re
 import time
 from collections import defaultdict, deque
 
-from aiogram import Bot, F, Router
-from aiogram.enums import ChatType, MessageEntityType
+from aiogram import Bot
+from aiogram.enums import MessageEntityType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Message
 
-from .. import actions
-from ..config import Config
-from ..db import Database
-from ..utils import Target, fmt_duration, is_anonymous_admin, is_staff, notify, user_mention
-
-router = Router(name="automod")
-router.message.filter(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+from ..core import Core
+from ..utils import is_anonymous_admin, is_staff, notify
 
 INVITE_RE = re.compile(r"(?:t\.me|telegram\.me|telegram\.dog)/(?:\+|joinchat/|[A-Za-z0-9_]{4,})", re.IGNORECASE)
 FLOOD_MUTE_SECONDS = 300
@@ -58,20 +55,9 @@ def find_bad_word(text: str, words: list[str]) -> str | None:
     return None
 
 
-@router.message()
-async def automod(message: Message, bot: Bot, db: Database, config: Config) -> None:
+async def check(core: Core, bot: Bot, message: Message) -> bool:
+    """Применяет автомодерацию. True — сообщение признано нарушением (дальше его разбирать не нужно)."""
     chat = message.chat
-    settings = await db.get_settings(chat.id)
-
-    # Служебные сообщения «вошёл/вышел»
-    if message.new_chat_members or message.left_chat_member:
-        if settings["delete_service"]:
-            try:
-                await message.delete()
-            except TelegramAPIError:
-                pass
-        return
-
     user = message.from_user
     if (
         not user
@@ -79,47 +65,42 @@ async def automod(message: Message, bot: Bot, db: Database, config: Config) -> N
         or is_anonymous_admin(message)
         or message.is_automatic_forward          # пересылки из привязанного канала
         or message.sender_chat                   # сообщения от имени каналов
-        or await is_staff(bot, chat.id, user.id)
+        or core.rank_of(chat.id, user.id) >= 1   # модераторы бота
+        or await is_staff(bot, chat.id, user.id)  # любые админы Telegram
     ):
-        return
+        return False
 
-    target = Target(user.id, user.full_name)
+    get = core.get
     text = message.text or message.caption or ""
 
-    async def punish_message(reason: str) -> None:
+    async def punish_message(reason: str) -> bool:
         try:
             await message.delete()
         except TelegramAPIError:
-            return  # нет прав удалять — не наказываем вслепую
-        verdict = await actions.apply_warn(
-            bot, db, config, chat.id, chat.title or "", target, reason, bot.id
-        )
-        await notify(bot, chat.id, verdict, ttl=NOTICE_TTL)
+            return False  # нет прав удалять — не наказываем вслепую
+        r = await core.warn(chat.id, user.id, 0, None, reason, "auto")
+        await notify(bot, chat.id, r.text, ttl=NOTICE_TTL)
+        return True
 
     # 1. Антифлуд
-    if settings["antiflood"] and is_flooding(chat.id, user.id, settings["flood_limit"], settings["flood_window"]):
-        try:
-            await actions.do_mute(bot, chat.id, user.id, FLOOD_MUTE_SECONDS)
-            await actions.modlog(bot, db, config, chat.id, chat.title or "", bot.id, user.id, "auto-mute", "флуд")
-            await notify(
-                bot, chat.id,
-                f"🔇 {user_mention(user)} в муте на {fmt_duration(FLOOD_MUTE_SECONDS)}: флуд.",
-                ttl=NOTICE_TTL,
-            )
-        except TelegramAPIError:
-            pass
-        return
+    if get(chat.id, "antiflood") and is_flooding(chat.id, user.id, get(chat.id, "flood_limit"),
+                                                 get(chat.id, "flood_window")):
+        r = await core.mute(chat.id, user.id, 0, FLOOD_MUTE_SECONDS, "флуд", "auto")
+        if r.ok:
+            await notify(bot, chat.id, r.text, ttl=NOTICE_TTL)
+        return True
 
     # 2. Инвайт-ссылки на другие чаты / каналы
-    if settings["antiinvite"] and has_invite(message):
+    if get(chat.id, "antiinvite") and has_invite(message):
         return await punish_message("реклама / инвайт-ссылка")
 
     # 3. Любые ссылки
-    if settings["antilink"] and has_link(message):
+    if get(chat.id, "antilink") and has_link(message):
         return await punish_message("ссылки запрещены")
 
     # 4. Запрещённые слова
-    if settings["badwords"] and text:
-        words = await db.get_words(chat.id)
+    if get(chat.id, "badwords") and text:
+        words = core.words(chat.id)
         if words and find_bad_word(text, words):
             return await punish_message("запрещённое слово")
+    return False

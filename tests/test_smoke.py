@@ -1,15 +1,17 @@
 """Сквозной тест: хендлеры + подставной Telegram API (сеть не нужна)."""
 import asyncio, tempfile, os, time
-from aiogram import Bot, Dispatcher
+from aiogram import Bot
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import (GetChatMember, SendMessage, GetChat, GetMe, DeleteMessage,
+from aiogram.methods import (GetChatMember, SendMessage, GetChat, GetChatAdministrators, GetMe, DeleteMessage,
                              RestrictChatMember, BanChatMember, UnbanChatMember)
 from aiogram.types import (Update, User, Message, ChatMemberAdministrator, ChatMemberMember,
                            ChatFullInfo, ChatPermissions)
 
 from crymoder.config import Config
-from crymoder.db import Database
-from crymoder.handlers import automod, captcha, common, moderation, settings
+from crymoder.core import Core
+from crymoder.db import DB
+from crymoder.handlers import captcha
+from crymoder.handlers.events import build_dispatcher
 
 ADMIN, USER, NEWBIE, CHAT = 1, 2, 3, -100500
 
@@ -31,6 +33,9 @@ class Fake(BaseSession):
             if method.user_id == ADMIN:
                 return ChatMemberAdministrator.model_construct(status="administrator", user=u, can_restrict_members=True)
             return ChatMemberMember.model_construct(status="member", user=u)
+        if isinstance(method, GetChatAdministrators):
+            u = User(id=ADMIN, is_bot=False, first_name=f"u{ADMIN}")
+            return [ChatMemberAdministrator.model_construct(status="administrator", user=u, can_restrict_members=True)]
         if isinstance(method, SendMessage):
             self.mid += 1
             return Message.model_validate(
@@ -64,13 +69,14 @@ def upd(uid, text, reply_to=None, n=[0]):
 
 async def scenario():
     tmp = tempfile.mkdtemp()
-    db = Database(os.path.join(tmp, "s.db")); await db.connect()
+    db = DB(os.path.join(tmp, "s.db"))
     cfg = Config("1:x", frozenset(), "", None, "INFO")
     sess = Fake()
     bot = Bot("1:" + "A" * 35, session=sess)
     bot._me = User(id=999, is_bot=True, first_name="bot", username="crymoder_bot")
-    dp = Dispatcher(db=db, config=cfg)
-    dp.include_routers(common.router, moderation.router, settings.router, captcha.router, automod.router)
+    core = Core(db, bot, cfg)
+    core.me_id, core.me_username = 999, "crymoder_bot"
+    dp = build_dispatcher(core, cfg)
 
     async def feed(d):
         await dp.feed_update(bot, Update.model_validate(d, context={"bot": bot}))
@@ -78,13 +84,16 @@ async def scenario():
     # 1. /warn x3 -> на 3-й мут
     for _ in range(3):
         await feed(upd(ADMIN, "/warn спам", reply_to=USER))
-    assert await db.warn_count(CHAT, USER) == 0, "после лимита варны сброшены"
+    assert len(core.active_warns(CHAT, USER)) == 0, "после лимита варны сброшены"
     assert "RestrictChatMember" in sess.names(), sess.names()
 
     # 2. не-админ не может warn
     sess.calls.clear()
     await feed(upd(USER, "/warn x", reply_to=ADMIN))
-    assert "RestrictChatMember" not in sess.names() and "SendMessage" not in sess.names()
+    assert "RestrictChatMember" not in sess.names()          # наказание не выполнено
+    refusal = [c for c in sess.calls if isinstance(c, SendMessage)]
+    assert refusal and "Недостаточно прав" in refusal[0].text, "участник получает отказ"
+    assert len(core.active_warns(CHAT, ADMIN)) == 0
 
     # 3. нельзя наказать админа
     sess.calls.clear()
@@ -96,14 +105,14 @@ async def scenario():
     await feed(upd(ADMIN, "/mute 10m тест", reply_to=USER))
     r = [c for c in sess.calls if isinstance(c, RestrictChatMember)][0]
     assert r.permissions.can_send_messages is False and r.until_date is not None
-    await feed(upd(ADMIN, "/ban 777"))
-    assert any(isinstance(c, BanChatMember) and c.user_id == 777 for c in sess.calls)
+    await feed(upd(ADMIN, "/ban 777777"))
+    assert any(isinstance(c, BanChatMember) and c.user_id == 777777 for c in sess.calls)
 
     # 5. фильтр слов + автомодерация (удаление + варн)
     await feed(upd(ADMIN, "/addword казино"))
     sess.calls.clear()
     await feed(upd(USER, "Лучшее КАЗИНО здесь"))
-    assert "DeleteMessage" in sess.names() and await db.warn_count(CHAT, USER) == 1, sess.names()
+    assert "DeleteMessage" in sess.names() and len(core.active_warns(CHAT, USER)) == 1, sess.names()
 
     # 6. инвайт-ссылка
     sess.calls.clear()
@@ -111,7 +120,7 @@ async def scenario():
     assert "DeleteMessage" in sess.names()
 
     # 7. флуд
-    await db.set_setting(CHAT, "flood_limit", 3)
+    core.put(CHAT, "flood_limit", 3)
     sess.calls.clear()
     for i in range(4):
         await feed(upd(NEWBIE + 10, f"м{i}"))
@@ -134,9 +143,9 @@ async def scenario():
         "from": {"id": ADMIN, "is_bot": False, "first_name": "a"},
         "message": {"message_id": 5, "date": int(time.time()),
                     "chat": {"id": CHAT, "type": "supergroup", "title": "T"}, "text": "s"}}}
-    before = (await db.get_settings(CHAT))["antilink"]
+    before = core.get(CHAT, "antilink")
     await feed(cb)
-    assert (await db.get_settings(CHAT))["antilink"] == 1 - before
+    assert core.get(CHAT, "antilink") == 1 - before
 
     # 10. капча: вход -> мут + кнопка; нажатие чужим -> отказ; нажатие своим -> размут
     join = {"update_id": 6000, "chat_member": {
@@ -147,31 +156,33 @@ async def scenario():
     sess.calls.clear()
     await feed(join)
     assert "RestrictChatMember" in sess.names() and "SendMessage" in sess.names(), sess.names()
-    assert await db.get_captcha(CHAT, NEWBIE)
+    assert core.captcha_get(CHAT, NEWBIE)
     cb2 = {"update_id": 6001, "callback_query": {
         "id": "2", "chat_instance": "c", "data": f"cap:{NEWBIE}",
         "from": {"id": USER, "is_bot": False, "first_name": "x"},
         "message": {"message_id": 9, "date": int(time.time()),
                     "chat": {"id": CHAT, "type": "supergroup", "title": "T"}, "text": "c"}}}
     await feed(cb2)
-    assert await db.get_captcha(CHAT, NEWBIE), "чужое нажатие не должно проходить капчу"
+    assert core.captcha_get(CHAT, NEWBIE), "чужое нажатие не должно проходить капчу"
     cb2["callback_query"]["from"]["id"] = NEWBIE
     cb2["update_id"] = 6002
     sess.calls.clear()
     await feed(cb2)
-    assert await db.get_captcha(CHAT, NEWBIE) is None
+    assert core.captcha_get(CHAT, NEWBIE) is None
     assert any(isinstance(c, RestrictChatMember) and c.permissions.can_send_messages for c in sess.calls)
 
     # 11. таймаут капчи -> кик
-    await db.set_setting(CHAT, "captcha_timeout", 30)
+    core.put(CHAT, "captcha_timeout", 30)
     sess.calls.clear()
     join["update_id"] = 6003
     await feed(join)
-    row = await db.get_captcha(CHAT, NEWBIE)
-    await captcha._expire(bot, db, CHAT, NEWBIE, row["message_id"], 0)
+    row = core.captcha_get(CHAT, NEWBIE)
+    await captcha._expire(bot, core, CHAT, NEWBIE, row["message_id"], 0)
     assert any(isinstance(c, BanChatMember) for c in sess.calls) and any(isinstance(c, UnbanChatMember) for c in sess.calls)
 
-    await db.close()
+    # 12. админ из Telegram стал модератором бота (ранг 2), а обычный участник — нет
+    assert core.rank_of(CHAT, ADMIN) == 2 and core.rank_of(CHAT, USER) == 0
+    db.close()
 
 
 

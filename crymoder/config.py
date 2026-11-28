@@ -18,6 +18,27 @@ def _load_dotenv(path: str = ".env") -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
+def _ids(name: str) -> frozenset[int]:
+    return frozenset(int(x) for x in os.getenv(name, "").replace(" ", "").split(",") if x.lstrip("-").isdigit())
+
+
+def _int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} должен быть числом, а не «{raw}».")
+
+
+def _bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on", "да")
+
+
 @dataclass(frozen=True)
 class Config:
     token: str
@@ -25,6 +46,13 @@ class Config:
     db_path: str
     log_chat_id: int | None
     log_level: str
+    # веб-панель и общие настройки (значения по умолчанию — чтобы Config(...) в тестах оставался коротким)
+    public_url: str = "http://localhost:8000"
+    web_enabled: bool = True
+    web_host: str = "0.0.0.0"
+    web_port: int = 8000
+    tz_offset_hours: int = 3
+    super_admins: frozenset[int] = frozenset()   # владельцы бота: полный доступ ко всем чатам и панели
 
 
 def load_config() -> Config:
@@ -33,9 +61,7 @@ def load_config() -> Config:
     if not token or token == "123456:replace_me":
         raise SystemExit("BOT_TOKEN не задан. Скопируйте .env.example в .env и впишите токен от @BotFather.")
 
-    owners = frozenset(
-        int(x) for x in os.getenv("OWNER_IDS", "").replace(" ", "").split(",") if x.lstrip("-").isdigit()
-    )
+    owners = _ids("OWNER_IDS")
     log_chat = os.getenv("LOG_CHAT_ID", "").strip()
     return Config(
         token=token,
@@ -43,4 +69,10 @@ def load_config() -> Config:
         db_path=os.getenv("DB_PATH", "data/crymoder.db"),
         log_chat_id=int(log_chat) if log_chat.lstrip("-").isdigit() else None,
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        public_url=os.getenv("PUBLIC_URL", "http://localhost:8000").strip().rstrip("/"),
+        web_enabled=_bool("WEB_ENABLED", True),
+        web_host=os.getenv("WEB_HOST", "0.0.0.0").strip(),
+        web_port=_int("WEB_PORT", 8000),
+        tz_offset_hours=_int("TZ_OFFSET_HOURS", 3),
+        super_admins=owners | _ids("SUPER_ADMINS"),
     )

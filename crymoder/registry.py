@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from .util import norm
+from .utils import norm
 
 
 @dataclass

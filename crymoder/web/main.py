@@ -5,9 +5,9 @@ from pathlib import Path
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
-from .. import config, handlers, registry  # handlers: чтобы заполнить реестр команд
+from .. import commands, registry  # commands: чтобы заполнить реестр команд
 from ..core import DISABLED, SETTINGS, Core
-from ..util import FOREVER, now, take_period
+from ..utils import now, take_period
 
 STATIC = Path(__file__).parent / "static"
 SESSION_TTL = 7 * 86400
@@ -20,7 +20,7 @@ CLEAN_CODE = {"inactive": "кик неактив", "silent": "кик молчу�
 
 
 def create_app(core: Core) -> FastAPI:
-    app = FastAPI(title="Chat Manager", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="CRYMODER", docs_url=None, redoc_url=None, openapi_url=None)
 
     # ---------- авторизация ----------
     def current_user(request: Request) -> int:
@@ -31,7 +31,7 @@ def create_app(core: Core) -> FastAPI:
         return r["user_id"]
 
     def is_super(uid: int) -> bool:
-        return uid in config.SUPER_ADMINS
+        return uid in core.super_admins
 
     def chat_rank(chat_id: int, uid: int) -> int:
         return 5 if is_super(uid) else core.rank_of(chat_id, uid)
@@ -59,7 +59,7 @@ def create_app(core: Core) -> FastAPI:
                         (sid, r["user_id"], now() + SESSION_TTL))
         resp = RedirectResponse("/", status_code=303)
         resp.set_cookie("sid", sid, max_age=SESSION_TTL, httponly=True, samesite="lax",
-                        secure=config.PUBLIC_URL.startswith("https://"))
+                        secure=core.config.public_url.startswith("https://") if core.config else False)
         return resp
 
     @app.post("/api/logout")
@@ -244,7 +244,7 @@ def create_app(core: Core) -> FastAPI:
             return mode, core.inactive_ids(chat_id, newcomers_secs=max(val * unit, 60))
         if mode == "active":
             return mode, core.inactive_ids(chat_id, active_secs=min(max(val * unit, 60), 600))
-        return mode, handlers._deleted_ids(core, chat_id)
+        return mode, commands._deleted_ids(core, chat_id)
 
     @app.post("/api/chats/{chat_id}/clean/preview")
     async def clean_preview(chat_id: int, body: dict = Body(...), uid: int = Depends(current_user)):

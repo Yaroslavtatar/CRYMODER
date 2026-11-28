@@ -1,23 +1,23 @@
-"""Команды в стиле Iris | Чат-менеджера. Каждая команда — функция с декоратором @cmd.
-Префиксы: «!», «.», «/», «Ирис», «Ириска». Команды модераторов работают и без префикса."""
+"""Все команды бота — в стиле Iris и со слеш-алиасами (/warn, /mute, /ban...). Каждая команда — функция
+с декоратором @cmd. Префиксы: «!», «.», «/», «Ирис», «Ириска». Команды модераторов работают и без префикса."""
 import logging
 import re
 import secrets
-import time
 
-from aiogram.types import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 
-from . import config, registry
-from .core import DISABLED, RANK_NAMES, SETTINGS, Core
+from . import registry
+from .handlers import settings as settings_ui
+from .core import DISABLED, RANK_NAMES, Core
 from .registry import COMMANDS, cmd, find_command, resolve_code
-from .util import (FOREVER, day_ago, esc, fmt_duration, fmt_ts, fmt_until, mention, norm, now, take_period,
-                   today_str)
+from .utils import FOREVER, esc, fmt_duration, fmt_ts, fmt_until, norm, now, take_period
 
-log = logging.getLogger("iris")
+log = logging.getLogger("crymoder.commands")
 
 # Фразы, которые не должны срабатывать без префикса, даже если команда для модераторов.
 AMBIGUOUS = {"вернуть", "говори", "заткнуть", "причина", "пред", "админ", "модер", "снять", "повысить",
-             "понизить", "позвать", "созвать"}
+             "понизить", "позвать", "созвать", "warns", "del", "settings", "настройки", "words", "слова",
+             "addword", "delword"}
 
 
 class Ctx:
@@ -292,14 +292,15 @@ async def h_warn(ctx: Ctx):
 
 
 @cmd("снять варн", "Снятие предупреждений", "Наказания", 1,
-     ["-варн", "снять варн", "снять варны", "снять все варны", "снять варн номер"], log=True)
+     ["-варн", "снять варн", "снять варны", "снять все варны", "снять варн номер", "unwarn", "resetwarns"],
+     log=True)
 async def h_unwarn(ctx: Ctx):
     ids, rest = await ctx.targets()
     if not await _need_targets(ctx, ids):
         return
     num = next((int(x) for x in rest if x.isdigit()), None)
     for t in ids:
-        if ctx.phrase == "снять все варны":
+        if ctx.phrase in ("снять все варны", "resetwarns"):
             r = ctx.core.unwarn(ctx.chat_id, t, ctx.uid, all_=True)
         elif ctx.phrase == "снять варн номер":
             r = ctx.core.unwarn(ctx.chat_id, t, ctx.uid, number=num or 1)
@@ -329,10 +330,20 @@ async def h_warns(ctx: Ctx):
     await ctx.reply(f"⚠️ Предупреждения {ctx.core.m(ids[0])} ({len(rows)}/{lim}):\n" + "\n".join(_warn_lines(ctx.core, rows)))
 
 
-@cmd("мои варны", "Мои предупреждения", "Наказания", 0, ["мои варны", "мои преды"])
+@cmd("мои варны", "Мои предупреждения", "Наказания", 0, ["мои варны", "мои преды", "warns"])
 async def h_my_warns(ctx: Ctx):
-    rows = ctx.core.active_warns(ctx.chat_id, ctx.uid)
+    target = ctx.uid
+    if ctx.rank >= 1:                       # модератор может посмотреть чужие: /warns в ответ на сообщение
+        ids, _ = await ctx.targets()
+        if ids:
+            target = ids[0]
+    rows = ctx.core.active_warns(ctx.chat_id, target)
     lim = ctx.core.get(ctx.chat_id, "warn_limit")
+    if target != ctx.uid:
+        if not rows:
+            return await ctx.reply(f"У {ctx.core.m(target)} нет предупреждений.")
+        return await ctx.reply(f"⚠️ Предупреждения {ctx.core.m(target)} ({len(rows)}/{lim}):\n"
+                               + "\n".join(_warn_lines(ctx.core, rows)))
     if not rows:
         return await ctx.reply("У вас нет предупреждений. 👍")
     await ctx.reply(f"⚠️ Ваши предупреждения ({len(rows)}/{lim}):\n" + "\n".join(_warn_lines(ctx.core, rows)))
@@ -348,19 +359,34 @@ async def h_warnlist(ctx: Ctx):
     await ctx.reply("⚠️ <b>Варнлист</b>\n" + "\n".join(f"{ctx.core.m(r['user_id'])} — {r['c']}" for r in rows))
 
 
+_WARN_ACTIONS = {"мут": "mute", "mute": "mute", "бан": "ban", "ban": "ban", "кик": "kick", "kick": "kick"}
+
+
 @cmd("варны настройка", "Настройка предупреждений", "Наказания", 3,
-     ["варны лимит", "варны чс", "варны период"], log=True)
+     ["варны лимит", "варны чс", "варны период", "варны действие", "варны мут"], log=True)
 async def h_warn_cfg(ctx: Ctx):
     if ctx.phrase == "варны лимит":
         if not ctx.tokens or not ctx.tokens[0].isdigit():
             return await ctx.err("Формат: варны лимит {число}")
         r = ctx.core.set_setting(ctx.chat_id, "warn_limit", ctx.tokens[0], ctx.uid, "chat")
         return await ctx.reply(("✅ Лимит варнов: " + ctx.tokens[0]) if r.ok else "❌ " + r.text)
+    if ctx.phrase == "варны действие":
+        act = _WARN_ACTIONS.get(ctx.tokens[0].lower()) if ctx.tokens else None
+        if not act:
+            return await ctx.err("Формат: варны действие мут|бан|кик")
+        ctx.core.set_setting(ctx.chat_id, "warn_action", act, ctx.uid, "chat")
+        return await ctx.reply(f"✅ При лимите варнов: {ctx.tokens[0].lower()}.")
     secs, _ = take_period(ctx.tokens)
     if secs is None:
         return await ctx.err("Укажите период, например: 3 дня")
-    key = "warn_ban_secs" if ctx.phrase == "варны чс" else "warn_ttl_secs"
-    ctx.core.put(ctx.chat_id, key, secs)
+    if ctx.phrase == "варны чс":              # бан на срок при лимите варнов
+        ctx.core.put(ctx.chat_id, "warn_action", "ban")
+        ctx.core.put(ctx.chat_id, "warn_ban_secs", 0 if secs == FOREVER else secs)
+    elif ctx.phrase == "варны мут":           # мут на срок при лимите варнов
+        ctx.core.put(ctx.chat_id, "warn_action", "mute")
+        ctx.core.put(ctx.chat_id, "warn_mute_secs", secs)
+    else:
+        ctx.core.put(ctx.chat_id, "warn_ttl_secs", 0 if secs == FOREVER else secs)
     await ctx.reply(f"✅ Установлено: {fmt_duration(secs)}.")
 
 
@@ -694,7 +720,7 @@ async def _delete_ids(ctx: Ctx, ids):
     return n
 
 
-@cmd("-смс", "Удаление сообщений", "Чистка чата", 2, ["-смс"], log=True)
+@cmd("-смс", "Удаление сообщений", "Чистка чата", 2, ["-смс", "del"], log=True)
 async def h_del(ctx: Ctx):
     toks = list(ctx.tokens)
     silent = "тихо" in toks
@@ -861,7 +887,7 @@ async def h_link_set(ctx: Ctx):
         ctx.core.db.execute("DELETE FROM settings WHERE chat_id=? AND key='invite_link'", (ctx.chat_id,))
         return await ctx.reply("✅ Ссылка удалена.")
     try:
-        lnk = await ctx.bot.create_chat_invite_link(ctx.chat_id, name="Chat manager",
+        lnk = await ctx.bot.create_chat_invite_link(ctx.chat_id, name="CRYMODER",
                                                     creates_join_request=ctx.phrase.endswith("по заявкам"))
     except Exception as e:
         return await ctx.err(esc(getattr(e, "message", str(e))))
@@ -1013,15 +1039,24 @@ async def h_msg_id(ctx: Ctx):
     await ctx.reply(f"ID сообщения: <code>{r.message_id if r else ctx.msg.message_id}</code>")
 
 
-@cmd("ид", "ID пользователя", "Профиль", 0, ["ид", "id"])
+@cmd("ид", "ID пользователя и чата", "Профиль", 0, ["ид", "id"], pm=True)
 async def h_id(ctx: Ctx):
-    ids, _ = await ctx.targets()
-    await ctx.reply("ID: <code>" + (str(ids[0]) if ids else str(ctx.uid)) + "</code>")
+    lines = [f"Ваш ID: <code>{ctx.uid}</code>"]
+    if ctx.msg.chat.type != "private":
+        lines.append(f"ID чата: <code>{ctx.chat_id}</code>")
+    r = ctx.real_reply()
+    if r and r.from_user:
+        lines.append(f"ID автора сообщения, на которое вы ответили: <code>{r.from_user.id}</code>")
+    else:
+        ids, _ = await ctx.targets()
+        if ids and ids[0] != ctx.uid:
+            lines.append(f"ID цели: <code>{ids[0]}</code>")
+    await ctx.reply("\n".join(lines))
 
 
 @cmd("обновить чат", "Обновить информацию о чате", "Настройка чата", 1, ["обновить чат"])
 async def h_refresh(ctx: Ctx):
-    await ctx.core.sync_creator(ctx.chat_id)
+    await ctx.core.sync_admins(ctx.chat_id)
     try:
         ch = await ctx.bot.get_chat(ctx.chat_id)
         ctx.core.ensure_chat(ctx.chat_id, ch.title or "")
@@ -1052,10 +1087,12 @@ async def h_tg_admin(ctx: Ctx):
 
 @cmd("панель", "Вход в веб-панель", "Настройка чата", 1, ["панель", "веб", "panel", "веб-панель"], pm=True)
 async def h_panel(ctx: Ctx):
+    if not ctx.core.config or not ctx.core.config.web_enabled:
+        return await ctx.reply("Веб-панель на этом боте отключена.")
     token = secrets.token_urlsafe(24)
     ctx.core.db.execute("INSERT INTO web_tokens(token,user_id,expires_at) VALUES(?,?,?)",
                         (token, ctx.uid, now() + 600))
-    url = f"{config.PUBLIC_URL}/login?t={token}"
+    url = f"{ctx.core.config.public_url}/login?t={token}"
     try:
         await ctx.bot.send_message(ctx.uid, f"🔐 Ссылка для входа в веб-панель (действует 10 минут, одноразовая):\n{url}")
     except Exception:
@@ -1427,6 +1464,44 @@ async def _as_result(r):
     return r
 
 
+# ============================================================ автомодерация
+
+_WORD_RE = re.compile(r"^[\w\-]{2,40}$")
+
+
+@cmd("слово добавить", "Добавить слово в фильтр", "Автомодерация", 2, ["addword", "+слово"], log=True)
+async def h_addword(ctx: Ctx):
+    w = norm(ctx.tokens[0]) if ctx.tokens else ""
+    if not _WORD_RE.match(w):
+        return await ctx.err("Формат: +слово {слово} — одно слово, 2–40 символов.")
+    ctx.core.add_word(ctx.chat_id, w)
+    ctx.core.audit(ctx.chat_id, ctx.uid, "+слово", w, "chat")
+    await ctx.reply(f"✅ Слово <code>{esc(w)}</code> добавлено в фильтр.")
+
+
+@cmd("слово удалить", "Убрать слово из фильтра", "Автомодерация", 2, ["delword", "-слово"], log=True)
+async def h_delword(ctx: Ctx):
+    w = norm(ctx.tokens[0]) if ctx.tokens else ""
+    if not w:
+        return await ctx.err("Формат: -слово {слово}")
+    if not ctx.core.del_word(ctx.chat_id, w):
+        return await ctx.err("Такого слова в фильтре нет.")
+    ctx.core.audit(ctx.chat_id, ctx.uid, "-слово", w, "chat")
+    await ctx.reply(f"✅ Слово <code>{esc(w)}</code> убрано из фильтра.")
+
+
+@cmd("слова", "Список запрещённых слов", "Автомодерация", 2, ["words", "слова"])
+async def h_words(ctx: Ctx):
+    ws = ctx.core.words(ctx.chat_id)
+    await ctx.reply("🚫 Запрещённые слова: " + ", ".join(f"<code>{esc(w)}</code>" for w in ws)
+                    if ws else "Фильтр слов пуст. Добавить: +слово {слово}")
+
+
+@cmd("настройки", "Панель настроек автомодерации", "Автомодерация", 2, ["settings", "настройки"])
+async def h_settings(ctx: Ctx):
+    await ctx.reply(settings_ui.TITLE, markup=settings_ui.build_keyboard(ctx.core, ctx.chat_id))
+
+
 # ============================================================ прочее
 
 @cmd("пинг", "Проверка работы бота", "Профиль", 0, ["пинг", "кинг", "пиу", "бот"])
@@ -1435,18 +1510,23 @@ async def h_ping(ctx: Ctx):
 
 
 HELP = (
-    "<b>Chat Manager</b> — бесплатный чат-менеджер в стиле Iris.\n\n"
+    "<b>CRYMODER</b> — бесплатный чат-менеджер в стиле Iris.\n\n"
     "<b>Модерация:</b> +модер [1-5] @ник, снять @ник, кто админ, модер лог\n"
     "<b>Наказания:</b> варн/мут/бан [срок] @ник (причина на следующей строке), -варн, -мут, разбан, кик, "
-    "банлист, муты, варнлист, амнистия, гб @ник (голосование)\n"
+    "банлист, муты, варнлист, мои варны, амнистия, гб @ник (голосование)\n"
+    "Те же команды со слешем: /warn /unwarn /warns /resetwarns /mute /unmute /ban /unban /kick /del "
+    "(срок: 30m, 2h, 1d или «2 часа»; цель — ответом, @ником или ID)\n"
     "<b>Чистка:</b> -смс N, пург, кик неактив 2 месяца, кик новичков 1 час, кик молчунов\n"
+    "<b>Автомодерация:</b> /settings (антифлуд, капча, ссылки, слова), +слово, -слово, слова, "
+    "варны лимит/действие\n"
     "<b>Настройки:</b> +правила, +приветствие, +автокик, -чат/+чат, -ссылки, -сайты, -боты, +автозаявки\n"
     "<b>Доступ команд:</b> доступ команд, дк бан 2, -дк бан, мой дк, +лдк\n"
     "<b>Статистика:</b> топ, стата неделя, моя стата, чат инфо, олды, новички\n"
-    "<b>Профиль:</b> профиль, +ник, +звание, +девиз, о себе\n"
+    "<b>Профиль:</b> профиль, +ник, +звание, +девиз, о себе, /id\n"
     "<b>Репутация:</b> «+» или «-» в ответ на сообщение, рейтинг\n"
     "<b>Веб-панель:</b> «панель» — пришлю ссылку для входа.\n"
-    "Префиксы: «!», «.», «/», «Ирис». Команды модерации работают и без префикса.")
+    "Префиксы: «!», «.», «/», «Ирис». Команды модерации работают и без префикса. "
+    "Админы Telegram с правом блокировки автоматически получают 2 ранг.")
 
 
 @cmd("помощь", "Помощь", "Профиль", 0, ["помощь", "help", "команды", "start"], pm=True)
@@ -1481,6 +1561,9 @@ async def handle_message(core: Core, bot, msg) -> bool:
     if not text or not msg.from_user:
         return False
     lines = text.split("\n")
+    mention_m = re.match(r"^/\S+?@(\w+)", lines[0].strip())
+    if mention_m and core.me_username and mention_m.group(1).lower() != core.me_username.lower():
+        return False                       # команда адресована другому боту
     first = re.sub(r"^(/\S+?)@\w+", r"\1", lines[0].strip())
     in_group = msg.chat.type in ("group", "supergroup")
 
@@ -1518,7 +1601,7 @@ async def handle_message(core: Core, bot, msg) -> bool:
     if in_group:
         core.ensure_chat(ctx.chat_id, msg.chat.title or "")
         if not core.creator_of(ctx.chat_id):
-            await core.sync_creator(ctx.chat_id)
+            await core.maybe_sync_admins(ctx.chat_id)
         if not core.has_access(ctx.chat_id, ctx.uid, c.code):
             if prefixed:
                 await ctx.reply("⛔ Недостаточно прав для этой команды.")
@@ -1545,7 +1628,7 @@ async def handle_message(core: Core, bot, msg) -> bool:
 
 
 def _can_open_panel(core: Core, uid: int) -> bool:
-    if uid in config.SUPER_ADMINS:
+    if uid in core.super_admins:
         return True
     return bool(core.db.one("SELECT 1 FROM ranks WHERE user_id=? AND rank>=1", (uid,)))
 

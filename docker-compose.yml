@@ -7,6 +7,12 @@ services:
     env_file: .env
     environment:
       DB_PATH: /data/crymoder.db
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: "8000"
+    # Веб-панель слушает только localhost сервера. Чтобы открыть её снаружи, поставьте перед ней
+    # nginx/Caddy с HTTPS и впишите адрес в PUBLIC_URL (.env).
+    ports:
+      - "127.0.0.1:8000:8000"
     volumes:
       - crymoder-data:/data
     logging:

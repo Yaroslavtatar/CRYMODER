@@ -1,18 +1,18 @@
-"""Проверка без Telegram: подставной бот + реальные обработчики и веб-API.
-Запуск: python -m tests.test_all"""
+"""Команды, ранги, наказания и веб-API без Telegram: подставной бот + реальные обработчики."""
 import asyncio
-import sys
 from types import SimpleNamespace as NS
 
 from fastapi.testclient import TestClient
 
-from app import handlers
-from app.core import Core
-from app.db import DB
-from app.web.main import create_app
+from crymoder import commands as handlers
+from crymoder.config import Config
+from crymoder.core import Core
+from crymoder.db import DB
+from crymoder.web.main import create_app
 
 CHAT = -1001
 CALLS = []
+CONFIG = Config("1:x", frozenset(), ":memory:", None, "INFO", public_url="http://panel.test")
 
 
 class FakeBot:
@@ -22,11 +22,14 @@ class FakeBot:
             if name == "get_chat":
                 return NS(permissions=None, type="supergroup")
             if name == "get_chat_administrators":
-                return [NS(status="creator", user=U(1, "boss"))]
+                return list(ADMINS)
             if name == "create_chat_invite_link":
                 return NS(invite_link="https://t.me/+abc")
             return True
         return f
+
+
+ADMINS = []
 
 
 def U(i, un=None, bot=False):
@@ -66,8 +69,10 @@ async def say(core, bot, text, uid, reply=None, **kw):
 async def main():
     db = DB(":memory:")
     bot = FakeBot()
-    core = Core(db, bot)
+    core = Core(db, bot, CONFIG)
     core.me_id = 999
+    core.me_username = "crymoder_bot"
+    ADMINS[:] = [NS(status="creator", user=U(1, "boss"))]
     for i, n in ((1, "boss"), (2, "mod"), (3, "user"), (4, "victim")):
         core.reg_user(U(i, n))
     core.ensure_chat(CHAT, "Test chat")
@@ -91,8 +96,10 @@ async def main():
     # варны до лимита
     for i in range(3):
         h, t = await say(core, bot, "варн @victim\nфлуд", 2)
-    check(any(n == "ban_chat_member" for n, *_ in CALLS), "3 варна → исключение")
-    check(len(core.active_warns(CHAT, 4)) == 0, "варны очищены после кика")
+    check(any(n == "restrict_chat_member" for n, *_ in CALLS) and core.db.one("SELECT 1 FROM mutes WHERE user_id=4"),
+          "3 варна → мут (действие по умолчанию, как в CRYMODER)")
+    check(len(core.active_warns(CHAT, 4)) == 0, "варны очищены после наказания")
+    await say(core, bot, "размут @victim", 2)
 
     # мут со сроком и причиной
     h, t = await say(core, bot, "мут 2 часа @victim\nспам", 2)
@@ -210,8 +217,108 @@ async def main():
     h, t = await say(core, bot, "панель", 1, chat=1, ctype="private")
     check(any("login?t=" in str(x) for x in sent_texts()), "«панель» присылает ссылку входа")
 
+    await extra_checks(core, bot)
+
     print(f"\nПровалено: {check.bad}")
-    sys.exit(1 if check.bad else 0)
+    assert check.bad == 0, f"провалено проверок: {check.bad}"
 
 
-asyncio.run(main())
+async def extra_checks(core, bot):
+    """Совместимость со слеш-командами CRYMODER и новые возможности единого бота."""
+    core.db.execute("DELETE FROM warns")
+    core.db.execute("DELETE FROM mutes")
+    core.db.execute("DELETE FROM bans")
+    core.reset_access(CHAT, 1)                      # доступ команд — по умолчанию
+    core.put(CHAT, "warn_limit", 3)
+    core.put(CHAT, "warn_action", "mute")
+
+    # --- слеш-команды и компактные сроки
+    h, t = await say(core, bot, "/mute 10m тест", 2, reply=M("x", 4))
+    r = core.db.one("SELECT * FROM mutes WHERE user_id=4")
+    check(r and 540 < r["until"] - r["created_at"] < 660 and r["reason"] == "тест", "/mute 10m работает как в CRYMODER")
+    await say(core, bot, "/unmute", 2, reply=M("x", 4))
+    check(core.db.one("SELECT 1 FROM mutes") is None, "/unmute")
+    h, t = await say(core, bot, "/ban 777777 реклама", 2)
+    check(core.db.one("SELECT * FROM bans WHERE user_id=777777"), "/ban по числовому ID")
+    await say(core, bot, "/unban 777777", 2)
+    check(core.db.one("SELECT 1 FROM bans") is None, "/unban по ID")
+    h, t = await say(core, bot, "/warn@crymoder_bot спам", 2, reply=M("x", 4))
+    check(len(core.active_warns(CHAT, 4)) == 1, "/warn@имя_этого_бота выполняется")
+    h, t = await say(core, bot, "/warn@other_bot спам", 2, reply=M("x", 4))
+    check(not h and len(core.active_warns(CHAT, 4)) == 1, "команда, адресованная другому боту, игнорируется")
+    h, t = await say(core, bot, "/warns", 3)
+    check("нет предупреждений" in t, "/warns участника показывает его собственные варны")
+    h, t = await say(core, bot, "/warns", 2, reply=M("x", 4))
+    check("1/3" in t, "/warns модератора в ответ на сообщение показывает чужие")
+    await say(core, bot, "/unwarn", 2, reply=M("x", 4))
+    check(len(core.active_warns(CHAT, 4)) == 0, "/unwarn снимает предупреждение")
+    for _ in range(2):
+        await say(core, bot, "/warn", 2, reply=M("x", 4))
+    await say(core, bot, "/resetwarns", 2, reply=M("x", 4))
+    check(len(core.active_warns(CHAT, 4)) == 0, "/resetwarns снимает все")
+    h, t = await say(core, bot, "/del", 2, reply=M("x", 4))
+    check(any(n in ("delete_message", "delete_messages") for n, *_ in CALLS), "/del удаляет сообщение")
+    h, t = await say(core, bot, "/id", 3, reply=M("x", 4))
+    check(str(CHAT) in t and "4" in t, "/id показывает ID чата и автора ответа")
+    h, t = await say(core, bot, "/id", 3, chat=3, ctype="private")
+    check(h and "3" in t and str(CHAT) not in t, "/id работает в личке")
+
+    # --- действие при лимите варнов: бан и кик
+    await say(core, bot, "варны действие бан", 1)
+    check(core.get(CHAT, "warn_action") == "ban", "варны действие бан")
+    for _ in range(3):
+        await say(core, bot, "/warn", 2, reply=M("x", 4))
+    check(core.db.one("SELECT 1 FROM bans WHERE user_id=4"), "лимит варнов → бан")
+    await say(core, bot, "разбан @victim", 2)
+    await say(core, bot, "варны действие кик", 1)
+    CALLS.clear()
+    for _ in range(3):
+        await say(core, bot, "/warn", 2, reply=M("x", 4))
+    names = [n for n, *_ in CALLS]
+    check("ban_chat_member" in names and "unban_chat_member" in names
+          and core.db.one("SELECT 1 FROM bans") is None, "лимит варнов → кик без записи в банлист")
+    await say(core, bot, "варны действие мут", 1)
+    await say(core, bot, "варны чс 3 дня", 1)
+    check(core.get(CHAT, "warn_action") == "ban" and core.get(CHAT, "warn_ban_secs") == 259200, "варны чс 3 дня")
+    await say(core, bot, "варны действие мут", 1)
+
+    # --- валидация числовых настроек
+    check(not core.set_setting(CHAT, "flood_limit", 1, 1, "chat").ok, "flood_limit вне диапазона отклоняется")
+    check(core.set_setting(CHAT, "flood_limit", 5, 1, "chat").ok and core.get(CHAT, "flood_limit") == 5, "flood_limit в диапазоне")
+
+    # --- фильтр слов и панель настроек через команды
+    h, t = await say(core, bot, "/addword Казино", 2)
+    check(core.words(CHAT) == ["казино"], "/addword нормализует слово")
+    h, t = await say(core, bot, "/words", 2)
+    check("казино" in t, "/words показывает список")
+    h, t = await say(core, bot, "/delword казино", 2)
+    check(core.words(CHAT) == [], "/delword")
+    h, t = await say(core, bot, "/addword казино", 3)
+    check(core.words(CHAT) == [] and "Недостаточно прав" in t, "участник не может менять фильтр слов")
+    h, t = await say(core, bot, "/settings", 2)
+    sent = [kw for n, a, kw in CALLS if n == "send_message"]
+    check(sent and sent[0].get("reply_markup"), "/settings отправляет клавиатуру")
+    h, t = await say(core, bot, "/settings", 3)
+    check("Недостаточно прав" in t, "участнику /settings недоступен")
+
+    # --- Telegram-админы автоматически получают ранг
+    ADMINS[:] = [NS(status="creator", user=U(1, "boss")),
+                 NS(status="administrator", user=U(30, "tgadmin"), can_restrict_members=True),
+                 NS(status="administrator", user=U(31, "cosmetic"), can_restrict_members=False)]
+    await core.sync_admins(CHAT)
+    check(core.rank_of(CHAT, 30) == 2, "TG-админ с правом блокировки получает 2 ранг")
+    check(core.rank_of(CHAT, 31) == 0, "TG-админ без права блокировки ранга не получает")
+    core.reg_user(U(30, "tgadmin"))
+    h, t = await say(core, bot, "/warn", 30, reply=M("x", 4))
+    check(len(core.active_warns(CHAT, 4)) == 1, "TG-админ может /warn")
+    await core.sync_creator(CHAT)
+    core.set_rank(CHAT, 3, 1, 1)
+    ADMINS[:] = [NS(status="creator", user=U(1, "boss"))]
+    await core.sync_admins(CHAT)
+    check(core.rank_of(CHAT, 30) == 0, "разжалованный в Telegram админ теряет авто-ранг")
+    check(core.rank_of(CHAT, 3) == 1, "вручную выданный ранг не трогается синхронизацией")
+    check(core.rank_of(CHAT, 1087968824) == 2, "анонимный админ действует как старший модератор")
+
+
+def test_commands_and_web():
+    asyncio.run(main())

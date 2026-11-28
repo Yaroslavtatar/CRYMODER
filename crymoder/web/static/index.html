@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Chat Manager — панель</title>
+<title>CRYMODER — панель</title>
 <style>
 :root{--bg:#f5f6f8;--card:#fff;--ink:#1b1f27;--mute:#697386;--line:#e3e6ec;--acc:#2f6bff;--acc-ink:#fff;--bad:#d4303f;--ok:#1f9d5b;--warn:#c27a00;--chip:#eef1f6}
 @media(prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1b2029;--ink:#e8ebf1;--mute:#8d97a8;--line:#2b3240;--acc:#5b8cff;--acc-ink:#0b1020;--bad:#ff6b78;--ok:#43c985;--warn:#f0b24a;--chip:#252c39}}
@@ -93,9 +93,9 @@ async function boot(){
 }
 function render(){
   const app=$("#app");
-  if(!S.me){app.innerHTML=`<div class="login card"><h2>Chat Manager</h2><p class="mute">Вход только через бота. Напишите ему в личные сообщения слово <b>панель</b> — он пришлёт одноразовую ссылку.</p></div>`;return}
-  if(!S.me.chats.length){app.innerHTML=`<header><h1>Chat Manager</h1><span class="sp"></span><span>${esc(S.me.name)}</span></header><main><div class="card empty">У вас нет чатов, где вы модератор. Добавьте бота в чат и получите ранг командой «+модер».</div></main>`;return}
-  app.innerHTML=`<header><h1>Chat Manager</h1>
+  if(!S.me){app.innerHTML=`<div class="login card"><h2>CRYMODER</h2><p class="mute">Вход только через бота. Напишите ему в личные сообщения слово <b>панель</b> — он пришлёт одноразовую ссылку.</p></div>`;return}
+  if(!S.me.chats.length){app.innerHTML=`<header><h1>CRYMODER</h1><span class="sp"></span><span>${esc(S.me.name)}</span></header><main><div class="card empty">У вас нет чатов, где вы модератор. Добавьте бота в чат и получите ранг командой «+модер».</div></main>`;return}
+  app.innerHTML=`<header><h1>CRYMODER</h1>
     <select id="chatsel">${S.me.chats.map(c=>`<option value="${c.chat_id}" ${c.chat_id==S.chat?"selected":""}>${esc(c.title||c.chat_id)} · ${c.rank} ранг</option>`).join("")}</select>
     <span class="sp"></span><span class="mute">${esc(S.me.name)}</span><button id="out">Выйти</button></header>
     <nav>${TABS.map(t=>`<button data-t="${t[0]}" class="${S.tab===t[0]?"on":""}">${t[1]}</button>`).join("")}</nav><main id="view"></main>`;

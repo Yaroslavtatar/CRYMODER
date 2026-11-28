@@ -1,24 +1,32 @@
 """Ядро: все действия модерации. Используется и командами бота, и веб-панелью,
 поэтому права проверяются здесь, а не в обработчиках."""
-import json
+import logging
 import random
 import string
+import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 
 from aiogram.types import ChatPermissions
 
 from . import registry
-from .util import FOREVER, esc, fmt_duration, fmt_until, full_name, mention, now, today_str, day_ago
+from .utils import spawn
+from .utils import FOREVER, esc, fmt_duration, fmt_until, full_name, mention, now, today_str, day_ago
 
 RANK_NAMES = {0: "участник", 1: "младший модератор", 2: "старший модератор",
               3: "младший администратор", 4: "старший администратор", 5: "создатель"}
 DISABLED = 6
+ANON_ADMIN_ID = 1087968824   # от этого «пользователя» Telegram приходят сообщения анонимных админов
+ANON_ADMIN_RANK = 2          # анонимный админ действует как старший модератор
+TG_ADMIN_RANK = 2            # ранг, который получают Telegram-админы с правом блокировки участников
+
+log = logging.getLogger("crymoder.core")
 
 # ключ: (тип, по умолчанию, описание)
 SETTINGS = {
-    "warn_limit": ("int", 3, "Лимит предупреждений до исключения"),
-    "warn_ban_secs": ("secs", 0, "Срок бана при лимите варнов (0 — просто кик, -1 — навсегда)"),
+    "warn_limit": ("int", 3, "Лимит предупреждений до наказания"),
+    "warn_action": ("choice:mute,ban,kick", "mute", "Наказание при лимите предупреждений"),
+    "warn_mute_secs": ("secs", 86400, "Срок мута при лимите варнов"),
+    "warn_ban_secs": ("secs", 0, "Срок бана при лимите варнов (0 — навсегда)"),
     "warn_ttl_secs": ("secs", 0, "Срок хранения предупреждения (0 — бессрочно)"),
     "mute_default_secs": ("secs", 604800, "Срок мута по умолчанию"),
     "ban_default_secs": ("secs", 0, "Срок бана по умолчанию (0 — навсегда)"),
@@ -38,7 +46,20 @@ SETTINGS = {
     "autokick_action": ("choice:kick,ban", "kick", "Автокик: наказание"),
     "autokick_silent_secs": ("secs", 0, "Автокик молчунов: срок без сообщений (0 — выключен)"),
     "mod_tags": ("bool", 0, "Показывать ID модератора в ответах"),
+    # автомодерация
+    "antiflood": ("bool", 1, "Антифлуд: мут за поток сообщений"),
+    "flood_limit": ("int", 6, "Антифлуд: сообщений в окне"),
+    "flood_window": ("int", 8, "Антифлуд: окно, секунд"),
+    "antilink": ("bool", 0, "Автомодерация: удалять любые ссылки и предупреждать"),
+    "antiinvite": ("bool", 1, "Автомодерация: удалять инвайт-ссылки и предупреждать"),
+    "badwords": ("bool", 1, "Автомодерация: фильтр запрещённых слов"),
+    "captcha": ("bool", 1, "Капча для новых участников"),
+    "captcha_timeout": ("int", 120, "Капча: время на прохождение, секунд"),
+    "delete_service": ("bool", 0, "Удалять служебные сообщения о входе и выходе"),
 }
+
+# допустимые границы числовых настроек: ключ -> (мин, макс)
+RANGES = {"warn_limit": (1, 50), "flood_limit": (3, 30), "flood_window": (3, 60), "captcha_timeout": (30, 600)}
 
 
 @dataclass
@@ -60,11 +81,18 @@ def ERR(t):
 
 
 class Core:
-    def __init__(self, db, bot=None):
+    def __init__(self, db, bot=None, config=None):
         self.db = db
         self.bot = bot
+        self.config = config
         self.me_id = 0
         self.me_username = ""
+        self._admin_sync: dict[int, float] = {}
+        self._words: dict[int, list[str]] = {}
+
+    @property
+    def super_admins(self) -> frozenset:
+        return self.config.super_admins if self.config else frozenset()
 
     # ---------- Telegram helper ----------
     async def _tg(self, coro):
@@ -122,19 +150,42 @@ class Core:
     def creator_of(self, chat_id: int):
         return self.db.scalar("SELECT creator_id FROM chats WHERE chat_id=?", (chat_id,))
 
-    async def sync_creator(self, chat_id: int) -> None:
-        """Определяет создателя чата через Telegram и даёт ему 5 ранг."""
+    async def sync_admins(self, chat_id: int) -> None:
+        """Подтягивает администраторов из Telegram: создатель получает 5 ранг, а админы с правом
+        блокировки участников — 2 ранг (если ранга у них ещё нет). Так команды, доступные админам
+        раньше, продолжают работать. Автоматически выданный 2 ранг снимается, когда админ разжалован."""
+        self._admin_sync[chat_id] = time.monotonic()
         try:
             admins = await self.bot.get_chat_administrators(chat_id)
         except Exception:
             return
+        tg_mods = set()
         for a in admins:
-            if getattr(a, "status", "") == "creator":
+            status = getattr(a, "status", "")
+            if status == "creator":
                 self.reg_user(a.user)
                 old = self.creator_of(chat_id)
                 self.db.execute("UPDATE chats SET creator_id=? WHERE chat_id=?", (a.user.id, chat_id))
                 if old != a.user.id and self.rank_of(chat_id, a.user.id) < 5:
                     self._put_rank(chat_id, a.user.id, 5, 0)
+            elif status == "administrator" and getattr(a, "can_restrict_members", False) and not a.user.is_bot:
+                self.reg_user(a.user)
+                tg_mods.add(a.user.id)
+                if self.rank_of(chat_id, a.user.id) == 0:
+                    self._put_rank(chat_id, a.user.id, TG_ADMIN_RANK, 0)
+        for r in self.db.query("SELECT user_id FROM ranks WHERE chat_id=? AND rank=? AND appointed_by=0",
+                               (chat_id, TG_ADMIN_RANK)):
+            if r["user_id"] not in tg_mods:
+                self._put_rank(chat_id, r["user_id"], 0, 0)
+
+    async def sync_creator(self, chat_id: int) -> None:
+        await self.sync_admins(chat_id)
+
+    async def maybe_sync_admins(self, chat_id: int, min_interval: float = 600) -> None:
+        """Синхронизация не чаще раза в min_interval секунд (чтобы не долбить Telegram API)."""
+        last = self._admin_sync.get(chat_id)
+        if last is None or time.monotonic() - last >= min_interval:
+            await self.sync_admins(chat_id)
 
     # ---------- настройки ----------
     def get(self, chat_id: int, key: str):
@@ -170,8 +221,8 @@ class Core:
                 raw = 1 if str(raw).lower() in ("1", "true", "on", "да") else 0
             elif typ in ("int", "secs"):
                 raw = int(raw)
-                if key == "warn_limit" and not 1 <= raw <= 50:
-                    return ERR("Лимит варнов: от 1 до 50")
+                if key in RANGES and not RANGES[key][0] <= raw <= RANGES[key][1]:
+                    return ERR(f"{SETTINGS[key][2]}: от {RANGES[key][0]} до {RANGES[key][1]}")
                 if typ == "int" and raw < 0:
                     return ERR("Значение не может быть отрицательным")
             elif typ.startswith("choice:"):
@@ -191,11 +242,27 @@ class Core:
     def audit(self, chat_id, by, action, detail="", source="chat") -> None:
         self.db.execute("INSERT INTO audit(chat_id,by_id,action,detail,source,at) VALUES(?,?,?,?,?,?)",
                         (chat_id, by, action, detail, source, now()))
+        log_chat = self.config.log_chat_id if self.config else None
+        if log_chat and self.bot:
+            try:
+                spawn(self._send_log(log_chat, chat_id, by, action, detail, source))
+            except RuntimeError:     # нет работающего цикла событий (скрипты, тесты)
+                pass
+
+    async def _send_log(self, log_chat, chat_id, by, action, detail, source) -> None:
+        title = self.db.scalar("SELECT title FROM chats WHERE chat_id=?", (chat_id,), "") or chat_id
+        who = self.m(by) if by else "система"
+        text = f"🛡 <b>{esc(action)}</b> · {esc(title)} (<code>{chat_id}</code>)\nКто: {who} [{esc(source)}]"
+        if detail:
+            text += f"\n{esc(detail)}"
+        await self._tg(self.bot.send_message(log_chat, text, disable_notification=True))
 
     # ---------- ранги ----------
     def rank_of(self, chat_id: int, uid: int) -> int:
         if uid == self.me_id and uid:
             return 5
+        if uid == ANON_ADMIN_ID:
+            return ANON_ADMIN_RANK
         return self.db.scalar("SELECT rank FROM ranks WHERE chat_id=? AND user_id=?", (chat_id, uid), 0)
 
     def _put_rank(self, chat_id, uid, new, by) -> int:
@@ -325,15 +392,21 @@ class Core:
         if reason:
             out += f"\nПричина: {esc(reason)}"
         if n >= limit:
-            bsecs = self.get(chat_id, "warn_ban_secs")
             self.db.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?", (chat_id, target))
-            if bsecs == 0:
-                r = await self._remove(chat_id, target, by=0, ban=False, reason="лимит предупреждений", source=source)
-            else:
-                r = await self.ban(chat_id, target, 0, None if bsecs == 0 else bsecs,
-                                   "лимит предупреждений", source)
-            out += "\n🚫 Лимит предупреждений достигнут. " + (r.text if r.ok else "Не удалось исключить: " + r.text)
+            r = await self._warn_punish(chat_id, target, source)
+            out += "\n🚫 Лимит предупреждений достигнут. " + (r.text if r.ok else "Не удалось наказать: " + r.text)
         return OK(out)
+
+    async def _warn_punish(self, chat_id, target, source) -> Result:
+        """Наказание за лимит предупреждений по настройке warn_action (мут / бан / кик)."""
+        action = self.get(chat_id, "warn_action")
+        reason = "лимит предупреждений"
+        if action == "ban":
+            bsecs = self.get(chat_id, "warn_ban_secs")
+            return await self.ban(chat_id, target, 0, bsecs if bsecs > 0 else FOREVER, reason, source)
+        if action == "kick":
+            return await self._remove(chat_id, target, 0, reason=reason, source=source)
+        return await self.mute(chat_id, target, 0, self.get(chat_id, "warn_mute_secs") or 86400, reason, source)
 
     def unwarn(self, chat_id, target, by, count=1, number=None, all_=False, source="chat") -> Result:
         ws = self.active_warns(chat_id, target)
@@ -621,6 +694,37 @@ class Core:
         return {"bans": bans, "mutes": mutes, "warns": warns}
 
     # ---------- фоновое обслуживание ----------
+    # ---------- запрещённые слова ----------
+    def words(self, chat_id: int) -> list[str]:
+        if chat_id not in self._words:
+            self._words[chat_id] = [r["word"] for r in self.db.query(
+                "SELECT word FROM badwords WHERE chat_id=? ORDER BY word", (chat_id,))]
+        return self._words[chat_id]
+
+    def add_word(self, chat_id: int, word: str) -> None:
+        self.db.execute("INSERT OR IGNORE INTO badwords(chat_id,word) VALUES(?,?)", (chat_id, word))
+        self._words.pop(chat_id, None)
+
+    def del_word(self, chat_id: int, word: str) -> bool:
+        had = bool(self.db.one("SELECT 1 FROM badwords WHERE chat_id=? AND word=?", (chat_id, word)))
+        self.db.execute("DELETE FROM badwords WHERE chat_id=? AND word=?", (chat_id, word))
+        self._words.pop(chat_id, None)
+        return had
+
+    # ---------- капча ----------
+    def captcha_add(self, chat_id: int, user_id: int, message_id: int, expires_at: int) -> None:
+        self.db.execute("INSERT OR REPLACE INTO captcha(chat_id,user_id,message_id,expires_at) VALUES(?,?,?,?)",
+                        (chat_id, user_id, message_id, expires_at))
+
+    def captcha_get(self, chat_id: int, user_id: int):
+        return self.db.one("SELECT * FROM captcha WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+
+    def captcha_del(self, chat_id: int, user_id: int) -> None:
+        self.db.execute("DELETE FROM captcha WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+
+    def captcha_all(self):
+        return self.db.query("SELECT * FROM captcha")
+
     def maintenance(self) -> None:
         t = now()
         self.db.execute("DELETE FROM mutes WHERE until>0 AND until<?", (t,))

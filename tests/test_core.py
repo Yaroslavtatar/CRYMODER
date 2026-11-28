@@ -1,25 +1,28 @@
-import asyncio
+import sqlite3
 
 import pytest
 
-from crymoder.db import Database
+from crymoder.core import Core
+from crymoder.db import DB
 from crymoder.handlers.automod import find_bad_word, has_invite, is_flooding
-from crymoder.utils import fmt_duration, parse_duration
+from crymoder.utils import FOREVER, fmt_duration, take_period
 
 
-def test_parse_duration():
-    assert parse_duration("10m") == 600
-    assert parse_duration("2h") == 7200
-    assert parse_duration("1d") == 86400
-    assert parse_duration("5s") == 30          # минимум 30 секунд
-    assert parse_duration("спам") is None
-    assert parse_duration("10") is None
+def test_take_period():
+    assert take_period(["10m", "x"]) == (600, ["x"])
+    assert take_period(["2h"]) == (7200, [])
+    assert take_period(["1d"]) == (86400, [])
+    assert take_period(["1w"]) == (604800, [])
+    assert take_period(["2", "часа", "спам"]) == (7200, ["спам"])
+    assert take_period(["навсегда"]) == (FOREVER, [])
+    assert take_period(["спам", "10"]) == (None, ["спам", "10"])
+    assert take_period(["10"]) == (None, ["10"])
 
 
 def test_fmt_duration():
-    assert fmt_duration(None) == "навсегда"
-    assert fmt_duration(600) == "10 мин"
-    assert fmt_duration(86400) == "1 д"
+    assert fmt_duration(FOREVER) == "навсегда"
+    assert fmt_duration(600) == "10 мин."
+    assert fmt_duration(86400) == "1 дн."
 
 
 def test_flood_detection():
@@ -56,37 +59,50 @@ def test_invite_detection(text, expected):
     assert has_invite(_Msg(text)) is expected
 
 
-def test_database(tmp_path):
-    async def run():
-        db = Database(str(tmp_path / "t.db"))
-        await db.connect()
-        try:
-            s = await db.get_settings(42)
-            assert s["max_warns"] == 3 and s["captcha"] == 1
+def test_settings_words_captcha(tmp_path):
+    db = DB(str(tmp_path / "t.db"))
+    core = Core(db)
+    assert core.get(42, "warn_limit") == 3 and core.get(42, "captcha") == 1
+    assert core.get(42, "warn_action") == "mute" and core.get(42, "warn_mute_secs") == 86400
 
-            await db.set_setting(42, "max_warns", 99)      # зажимается в диапазон
-            assert (await db.get_settings(42))["max_warns"] == 10
-            await db.set_setting(42, "antilink", 1)
-            assert (await db.get_settings(42))["antilink"] == 1
-            with pytest.raises(ValueError):
-                await db.set_setting(42, "warn_action", "explode")
+    assert core.set_setting(42, "warn_limit", 5, 1, "chat").ok and core.get(42, "warn_limit") == 5
+    assert not core.set_setting(42, "warn_limit", 99, 1, "chat").ok       # вне диапазона
+    assert not core.set_setting(42, "warn_action", "explode", 1, "chat").ok
+    assert core.set_setting(42, "antilink", 1, 1, "chat").ok and core.get(42, "antilink") == 1
 
-            assert await db.add_warn(42, 7, "a") == 1
-            assert await db.add_warn(42, 7, "b") == 2
-            assert await db.remove_last_warn(42, 7) == 1
-            await db.reset_warns(42, 7)
-            assert await db.warn_count(42, 7) == 0
+    core.add_word(42, "слово")
+    assert core.words(42) == ["слово"]
+    assert core.del_word(42, "слово") is True and core.del_word(42, "слово") is False
+    assert core.words(42) == []
 
-            await db.add_word(42, "слово")
-            assert await db.get_words(42) == ["слово"]
-            assert await db.del_word(42, "слово") is True
-            assert await db.get_words(42) == []
+    core.captcha_add(42, 7, 100, 123)
+    assert core.captcha_get(42, 7)["message_id"] == 100
+    assert len(core.captcha_all()) == 1
+    core.captcha_del(42, 7)
+    assert core.captcha_get(42, 7) is None
 
-            await db.add_captcha(42, 7, 100, 123)
-            assert (await db.get_captcha(42, 7))["message_id"] == 100
-            await db.del_captcha(42, 7)
-            assert await db.get_captcha(42, 7) is None
-        finally:
-            await db.close()
 
-    asyncio.run(run())
+def test_migration_from_old_crymoder_db(tmp_path):
+    """База версии 0.1 (старые warns без by_id/expires_at, лимит в max_warns) открывается без потерь."""
+    path = str(tmp_path / "old.db")
+    old = sqlite3.connect(path)
+    old.executescript("""
+        CREATE TABLE settings(chat_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(chat_id,key));
+        CREATE TABLE warns(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                           reason TEXT, created_at INTEGER NOT NULL);
+        CREATE TABLE badwords(chat_id INTEGER NOT NULL, word TEXT NOT NULL, PRIMARY KEY(chat_id,word));
+        INSERT INTO settings VALUES (42,'max_warns','5'),(42,'antilink','1'),(42,'warn_action','ban');
+        INSERT INTO warns(chat_id,user_id,reason,created_at) VALUES (42,7,'старый варн',1000000000);
+        INSERT INTO badwords VALUES (42,'казино');
+    """)
+    old.commit()
+    old.close()
+
+    db = DB(path)
+    core = Core(db)
+    assert core.get(42, "warn_limit") == 5            # max_warns → warn_limit
+    assert core.get(42, "antilink") == 1 and core.get(42, "warn_action") == "ban"
+    assert core.words(42) == ["казино"]
+    w = core.active_warns(42, 7)
+    assert len(w) == 1 and w[0]["reason"] == "старый варн" and w[0]["expires_at"] == 0   # старый варн жив
+    DB(path)                                           # повторная миграция безопасна
